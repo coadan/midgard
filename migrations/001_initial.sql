@@ -1,0 +1,131 @@
+CREATE TABLE IF NOT EXISTS workbenches (
+  id TEXT PRIMARY KEY,
+  root TEXT NOT NULL UNIQUE,
+  config_path TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS repos (
+  id TEXT PRIMARY KEY,
+  workbench_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  main_ref TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (workbench_id) REFERENCES workbenches(id)
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  workbench_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  objective TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (workbench_id) REFERENCES workbenches(id)
+);
+
+CREATE TABLE IF NOT EXISTS task_repos (
+  task_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  PRIMARY KEY (task_id, repo_id),
+  FOREIGN KEY (task_id) REFERENCES tasks(id),
+  FOREIGN KEY (repo_id) REFERENCES repos(id)
+);
+
+CREATE TABLE IF NOT EXISTS worktrees (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  start_ref TEXT NOT NULL,
+  start_commit TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_id) REFERENCES tasks(id),
+  FOREIGN KEY (repo_id) REFERENCES repos(id)
+);
+
+CREATE TABLE IF NOT EXISTS leases (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT,
+  FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT,
+  type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+  id TEXT PRIMARY KEY,
+  task_id TEXT,
+  type TEXT NOT NULL,
+  path TEXT NOT NULL,
+  checksum TEXT,
+  producer_role TEXT,
+  state TEXT NOT NULL DEFAULT 'sealed',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS streams (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  raw_artifact_id TEXT,
+  parser_version TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS parser_errors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stream_id TEXT NOT NULL,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  source_range TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (stream_id) REFERENCES streams(id)
+);
+
+CREATE TABLE IF NOT EXISTS repair_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stream_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  error_codes TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (stream_id) REFERENCES streams(id)
+);
+
+CREATE TABLE IF NOT EXISTS providers (
+  id TEXT PRIMARY KEY,
+  family TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS usage_records (
+  id TEXT PRIMARY KEY,
+  task_id TEXT,
+  provider_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  raw_payload TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cost_rollups (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  amount_usd TEXT NOT NULL,
+  caveats TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

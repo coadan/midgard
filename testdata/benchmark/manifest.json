@@ -1,0 +1,23 @@
+{
+  "id": "local-fixture",
+  "title": "Local Fixture",
+  "items": [
+    {
+      "id": "readme-change",
+      "title": "Change README",
+      "objective": "Modify README and verify the diff.",
+      "task_id": "task_fixture",
+      "repo_ids": ["repo1"],
+      "checks": ["git diff --check"],
+      "hidden_reference_prs": [
+        {
+          "forge": "github",
+          "repo": "example/project",
+          "number": 42,
+          "url": "https://github.com/example/project/pull/42",
+          "merged_commit": "abc123"
+        }
+      ]
+    }
+  ]
+}

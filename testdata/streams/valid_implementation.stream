@@ -1,0 +1,22 @@
+@say starting implementation
+@report implementation.mdx
+# Implementation
+
+## Approach
+Generate a small Python edit helper and run it through the command executor.
+
+@payload begin type:script path:scripts/edit_timeout.py lang:python
+from pathlib import Path
+
+path = Path("internal/command/executor.go")
+text = path.read_text()
+path.write_text(text.replace("oldTimeout", "newTimeout"))
+@payload end
+@edit file:internal/command/executor.go action:modify mode:script content:artifact:scripts/edit_timeout.py reason:timeout-propagation
+@cmd repo:midgard -- python3 .midgard/artifacts/task_123/scripts/edit_timeout.py
+
+## Verification
+Run focused command executor tests.
+
+@ref file:internal/command/executor.go
+@result status:ready artifact:implementation.mdx checks:command-tests
