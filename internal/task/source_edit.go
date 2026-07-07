@@ -253,14 +253,93 @@ func sourceEditContext(ctx context.Context, wt WorktreeStatus, edit stream.EditI
 	var b strings.Builder
 	b.WriteString("repo:")
 	b.WriteString(wt.RepoID)
-	b.WriteString("\nfile:")
-	b.WriteString(edit.File)
+	b.WriteByte('\n')
+	for index, target := range sourceEditContextTargets(edit.File, patchStderr) {
+		if index > 0 {
+			b.WriteByte('\n')
+		}
+		writeSourceEditFileContext(ctx, &b, wt.Path, target)
+	}
+	return []byte(b.String())
+}
+
+type sourceEditContextTarget struct {
+	Path       string
+	Line       int
+	Targeted   bool
+	Primary    bool
+	RejectFile bool
+}
+
+func sourceEditContextTargets(editFile, patchStderr string) []sourceEditContextTarget {
+	byPath := map[string]int{}
+	var targets []sourceEditContextTarget
+	add := func(path string, line int, rejectFile bool) {
+		path = strings.TrimSpace(strings.TrimSuffix(path, ".rej"))
+		if path == "" {
+			return
+		}
+		if existing, ok := byPath[path]; ok {
+			if line > 0 && existing >= 0 {
+				targets[existing].Line = line
+				targets[existing].Targeted = true
+			}
+			if rejectFile {
+				targets[existing].RejectFile = true
+			}
+			return
+		}
+		byPath[path] = len(targets)
+		targets = append(targets, sourceEditContextTarget{
+			Path:       path,
+			Line:       line,
+			Targeted:   line > 0,
+			RejectFile: rejectFile,
+		})
+	}
+	if strings.TrimSpace(editFile) != "" {
+		add(editFile, 0, false)
+		targets[0].Primary = true
+	}
+	for _, match := range patchFailedPathLinePattern.FindAllStringSubmatch(patchStderr, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		line, err := strconv.Atoi(match[2])
+		if err != nil || line <= 0 {
+			line = 0
+		}
+		add(match[1], line, false)
+	}
+	for _, match := range rejectedPatchFilePattern.FindAllStringSubmatch(patchStderr, -1) {
+		if len(match) == 2 {
+			add(match[1], 0, true)
+		}
+	}
+	if len(targets) == 0 {
+		return []sourceEditContextTarget{{Path: editFile, Primary: true}}
+	}
+	if len(targets) > 8 {
+		targets = targets[:8]
+	}
+	return targets
+}
+
+func writeSourceEditFileContext(ctx context.Context, b *strings.Builder, root string, target sourceEditContextTarget) {
+	b.WriteString("file:")
+	b.WriteString(target.Path)
+	if target.Primary {
+		b.WriteString(" primary:true")
+	}
+	if target.RejectFile {
+		b.WriteString(" rejected:true")
+	}
 	b.WriteString("\n\nfile_context:\n")
-	path, err := repoFilePath(wt.Path, edit.File)
+	path, err := repoFilePath(root, target.Path)
 	if err != nil {
 		b.WriteString(err.Error())
 		b.WriteByte('\n')
-		return []byte(b.String())
+		return
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -269,11 +348,11 @@ func sourceEditContext(ctx context.Context, wt WorktreeStatus, edit stream.EditI
 	} else {
 		lines := contentLines(string(data))
 		const maxLines = 160
-		start, end, targetLine, targeted := sourceEditContextWindow(lines, patchStderr, maxLines)
+		start, end, targetLine, targeted := sourceEditContextWindow(lines, target.Line, maxLines)
 		if targeted {
-			fmt.Fprintf(&b, "[showing lines %d-%d of %d around failed patch line %d]\n", start+1, end, len(lines), targetLine)
+			fmt.Fprintf(b, "[showing lines %d-%d of %d around failed patch line %d]\n", start+1, end, len(lines), targetLine)
 			if start > 0 {
-				fmt.Fprintf(&b, "[omitted lines 1-%d]\n", start)
+				fmt.Fprintf(b, "[omitted lines 1-%d]\n", start)
 			}
 		}
 		for i := start; i < end; i++ {
@@ -281,17 +360,17 @@ func sourceEditContext(ctx context.Context, wt WorktreeStatus, edit stream.EditI
 			if len(line) > 300 {
 				line = line[:300] + " [truncated]"
 			}
-			fmt.Fprintf(&b, "%4d | %s\n", i+1, line)
+			fmt.Fprintf(b, "%4d | %s\n", i+1, line)
 		}
 		if end < len(lines) {
 			if targeted {
-				fmt.Fprintf(&b, "[omitted lines %d-%d]\n", end+1, len(lines))
+				fmt.Fprintf(b, "[omitted lines %d-%d]\n", end+1, len(lines))
 			} else {
-				fmt.Fprintf(&b, "[truncated after %d lines]\n", maxLines)
+				fmt.Fprintf(b, "[truncated after %d lines]\n", maxLines)
 			}
 		}
 	}
-	diff, err := gitrepo.Run(ctx, wt.Path, "diff", "--", edit.File)
+	diff, err := gitrepo.Run(ctx, root, "diff", "--", target.Path)
 	if err == nil && strings.TrimSpace(diff) != "" {
 		b.WriteString("\ncurrent_diff:\n")
 		if len(diff) > 12<<10 {
@@ -302,17 +381,17 @@ func sourceEditContext(ctx context.Context, wt WorktreeStatus, edit stream.EditI
 			b.WriteByte('\n')
 		}
 	}
-	return []byte(b.String())
 }
 
 var patchFailedLinePattern = regexp.MustCompile(`(?m)patch failed: .*:(\d+)$`)
+var patchFailedPathLinePattern = regexp.MustCompile(`(?m)patch failed: ([^:\n]+):(\d+)$`)
+var rejectedPatchFilePattern = regexp.MustCompile(`(?m)^file:([^\n]+)$`)
 
-func sourceEditContextWindow(lines []string, patchStderr string, maxLines int) (start, end, targetLine int, targeted bool) {
+func sourceEditContextWindow(lines []string, targetLine, maxLines int) (start, end int, line int, targeted bool) {
 	if maxLines <= 0 || len(lines) <= maxLines {
 		return 0, len(lines), 0, false
 	}
-	targetLine, targeted = failedPatchLine(patchStderr)
-	if !targeted {
+	if targetLine <= 0 {
 		return 0, min(len(lines), maxLines), 0, false
 	}
 	targetIndex := max(0, min(len(lines)-1, targetLine-1))

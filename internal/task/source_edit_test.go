@@ -88,3 +88,42 @@ func TestSourceEditContextCentersFailedPatchLine(t *testing.T) {
 		t.Fatalf("source edit context should not start at file head for late failures:\n%s", got)
 	}
 }
+
+func TestSourceEditContextIncludesRejectedPatchFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "primary.clj"), []byte("(ns primary)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for i := 1; i <= 220; i++ {
+		fmt.Fprintf(&b, "secondary line %03d\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "secondary.clj"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stderr := strings.Join([]string{
+		"error: patch failed: src/secondary.clj:180",
+		"error: src/secondary.clj: patch does not apply",
+		"rejected hunks:",
+		"file:src/secondary.clj.rej",
+	}, "\n")
+	got := string(sourceEditContext(
+		context.Background(),
+		WorktreeStatus{RepoID: "repo1", Path: root},
+		stream.EditIntent{File: "src/primary.clj"},
+		stderr,
+	))
+	if !strings.Contains(got, "file:src/primary.clj primary:true") {
+		t.Fatalf("source edit context missing primary edit file:\n%s", got)
+	}
+	if !strings.Contains(got, "file:src/secondary.clj rejected:true") {
+		t.Fatalf("source edit context missing rejected file:\n%s", got)
+	}
+	if !strings.Contains(got, "around failed patch line 180") ||
+		!strings.Contains(got, " 180 | secondary line 180") {
+		t.Fatalf("source edit context missing rejected file failed line:\n%s", got)
+	}
+}

@@ -18,6 +18,8 @@ const maxContextSnippetLines = 120
 const maxContextDiffBytes = 16 << 10
 const maxReportContextBytes = 6 << 10
 const maxContextFileIndexEntries = 80
+const maxObjectiveSnippetCandidateFiles = 64
+const maxObjectiveSnippetFallbackFiles = 64
 
 func contextPacket(ctx context.Context, status StatusResult, layout workbench.Layout) string {
 	var b strings.Builder
@@ -108,9 +110,34 @@ func latestRoleStatusContext(ctx context.Context, layout workbench.Layout, taskI
 }
 
 func objectiveFileIndex(objective string, worktrees []WorktreeStatus) string {
+	matches := objectiveFileMatches(objective, worktrees, maxContextFileIndexEntries)
+	if len(matches) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, match := range matches {
+		b.WriteString("repo:")
+		b.WriteString(match.RepoID)
+		b.WriteString(" file:")
+		b.WriteString(match.Path)
+		b.WriteString(" score:")
+		b.WriteString(fmt.Sprintf("%d", match.Score))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+type fileIndexMatch struct {
+	RepoID string
+	Root   string
+	Path   string
+	Score  int
+}
+
+func objectiveFileMatches(objective string, worktrees []WorktreeStatus, limit int) []fileIndexMatch {
 	terms := objectiveSearchTerms(objective)
 	if len(terms) == 0 {
-		return ""
+		return nil
 	}
 	var matches []fileIndexMatch
 	for _, wt := range worktrees {
@@ -132,17 +159,23 @@ func objectiveFileIndex(objective string, worktrees []WorktreeStatus) string {
 			if err != nil {
 				return nil
 			}
-			score := fileIndexScore(filepath.ToSlash(rel), terms)
+			rel = filepath.ToSlash(rel)
+			score := fileIndexScore(rel, terms)
 			if score == 0 {
 				return nil
 			}
-			matches = append(matches, fileIndexMatch{RepoID: wt.RepoID, Path: filepath.ToSlash(rel), Score: score})
+			matches = append(matches, fileIndexMatch{RepoID: wt.RepoID, Root: root, Path: rel, Score: score})
 			return nil
 		})
 	}
-	if len(matches) == 0 {
-		return ""
+	sortFileIndexMatches(matches)
+	if limit > 0 && len(matches) > limit {
+		matches = matches[:limit]
 	}
+	return matches
+}
+
+func sortFileIndexMatches(matches []fileIndexMatch) {
 	slices.SortFunc(matches, func(a, b fileIndexMatch) int {
 		if a.Score != b.Score {
 			return b.Score - a.Score
@@ -152,26 +185,6 @@ func objectiveFileIndex(objective string, worktrees []WorktreeStatus) string {
 		}
 		return strings.Compare(a.Path, b.Path)
 	})
-	if len(matches) > maxContextFileIndexEntries {
-		matches = matches[:maxContextFileIndexEntries]
-	}
-	var b strings.Builder
-	for _, match := range matches {
-		b.WriteString("repo:")
-		b.WriteString(match.RepoID)
-		b.WriteString(" file:")
-		b.WriteString(match.Path)
-		b.WriteString(" score:")
-		b.WriteString(fmt.Sprintf("%d", match.Score))
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
-
-type fileIndexMatch struct {
-	RepoID string
-	Path   string
-	Score  int
 }
 
 func objectiveSearchTerms(objective string) []string {
@@ -204,13 +217,14 @@ func fileIndexScore(path string, terms []string) int {
 			score += 2
 		}
 	}
+	if score == 0 {
+		return 0
+	}
 	switch filepath.Ext(path) {
 	case ".clj", ".cljc", ".cljs", ".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs":
 		score++
 	case ".md", ".txt", ".rst":
-		if score > 0 {
-			score--
-		}
+		score--
 	}
 	return score
 }
@@ -274,47 +288,10 @@ func objectiveSnippets(objective string, worktrees []WorktreeStatus) string {
 		return ""
 	}
 	searchTerms := objectiveSearchTerms(objective)
-	var fileMatches []snippetFileMatch
-	for _, wt := range worktrees {
-		root := wt.Path
-		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if entry.IsDir() {
-				if shouldSkipDir(entry.Name()) {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if !looksTextPath(path) {
-				return nil
-			}
-			info, err := entry.Info()
-			if err != nil || info.Size() > 1<<20 {
-				return nil
-			}
-			data, err := os.ReadFile(path)
-			if err != nil || !looksText(data) {
-				return nil
-			}
-			rel, err := filepath.Rel(root, path)
-			if err != nil {
-				return nil
-			}
-			matches := matchingLines(string(data), tokens)
-			if len(matches) == 0 {
-				return nil
-			}
-			rel = filepath.ToSlash(rel)
-			fileMatches = append(fileMatches, snippetFileMatch{
-				RepoID: wt.RepoID,
-				Path:   rel,
-				Score:  contentMatchScore(rel, string(data), tokens, searchTerms),
-				Lines:  matches,
-			})
-			return nil
-		})
+	candidates := objectiveFileMatches(objective, worktrees, maxObjectiveSnippetCandidateFiles)
+	fileMatches := snippetFileMatches(candidates, tokens, searchTerms)
+	if len(fileMatches) == 0 {
+		fileMatches = snippetFileMatches(objectiveFallbackSnippetFiles(worktrees, maxObjectiveSnippetFallbackFiles), tokens, searchTerms)
 	}
 	if len(fileMatches) == 0 {
 		return ""
@@ -352,6 +329,75 @@ func objectiveSnippets(objective string, worktrees []WorktreeStatus) string {
 	}
 	return b.String()
 }
+
+func objectiveFallbackSnippetFiles(worktrees []WorktreeStatus, limit int) []fileIndexMatch {
+	if limit <= 0 {
+		return nil
+	}
+	var matches []fileIndexMatch
+	for _, wt := range worktrees {
+		root := wt.Path
+		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if entry.IsDir() {
+				if shouldSkipDir(entry.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !looksTextPath(path) {
+				return nil
+			}
+			info, err := entry.Info()
+			if err != nil || info.Size() > 1<<20 {
+				return nil
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return nil
+			}
+			matches = append(matches, fileIndexMatch{RepoID: wt.RepoID, Root: root, Path: filepath.ToSlash(rel)})
+			if len(matches) >= limit {
+				return errStopWalk
+			}
+			return nil
+		})
+		if len(matches) >= limit {
+			break
+		}
+	}
+	return matches
+}
+
+func snippetFileMatches(candidates []fileIndexMatch, tokens, searchTerms []string) []snippetFileMatch {
+	var fileMatches []snippetFileMatch
+	for _, candidate := range candidates {
+		path := filepath.Join(candidate.Root, filepath.FromSlash(candidate.Path))
+		info, err := os.Stat(path)
+		if err != nil || info.Size() > 1<<20 {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || !looksText(data) {
+			continue
+		}
+		matches := matchingLines(string(data), tokens)
+		if len(matches) == 0 {
+			continue
+		}
+		fileMatches = append(fileMatches, snippetFileMatch{
+			RepoID: candidate.RepoID,
+			Path:   candidate.Path,
+			Score:  contentMatchScore(candidate.Path, string(data), tokens, searchTerms),
+			Lines:  matches,
+		})
+	}
+	return fileMatches
+}
+
+var errStopWalk = filepath.SkipAll
 
 type snippetFileMatch struct {
 	RepoID string
