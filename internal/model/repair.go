@@ -21,6 +21,14 @@ type Runner struct {
 
 type CommandHandler func(ctx context.Context, commands []stream.CommandProposal) (string, error)
 
+type RepairExhaustedError struct {
+	ErrorCodes []string
+}
+
+func (e RepairExhaustedError) Error() string {
+	return fmt.Sprintf("repair attempts exhausted: %v", e.ErrorCodes)
+}
+
 func (r Runner) Run(ctx context.Context, packet Packet) (RunResult, error) {
 	if r.Provider == nil {
 		return RunResult{}, fmt.Errorf("provider is required")
@@ -123,7 +131,7 @@ func (r Runner) Run(ctx context.Context, packet Packet) (RunResult, error) {
 			return result, nil
 		}
 		if repairAttempts >= maxRepairs {
-			return result, fmt.Errorf("repair attempts exhausted: %v", parsed.Repair.ErrorCodes)
+			return result, RepairExhaustedError{ErrorCodes: append([]string(nil), parsed.Repair.ErrorCodes...)}
 		}
 		repairAttempts++
 		current = RepairPacket(current, parsed.Repair)
@@ -134,19 +142,16 @@ func shouldContinueWithCommands(role Role, parsed *stream.ParseResult) bool {
 	if parsed == nil || len(parsed.Commands) == 0 {
 		return false
 	}
+	if len(parsed.Edits) > 0 {
+		return false
+	}
 	if parsed.Result == nil {
 		return commandContinuationErrorsAllowed(parsed, false)
 	}
 	if role != RoleImplementer {
 		return false
 	}
-	if len(parsed.Edits) == 0 {
-		return commandContinuationErrorsAllowed(parsed, true)
-	}
-	if !commandContinuationTerminalStatus(parsed.Result.Status) {
-		return false
-	}
-	return parsed.Repair == nil || commandContinuationErrorsAllowed(parsed, true)
+	return commandContinuationErrorsAllowed(parsed, true)
 }
 
 func commandContinuationTerminalStatus(status string) bool {

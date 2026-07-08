@@ -72,6 +72,16 @@ func TestRepairPacketUsesRoleReportPath(t *testing.T) {
 		!strings.Contains(repaired.RepairInstructions, "Do not use repair.mdx") {
 		t.Fatalf("repair instructions:\n%s", repaired.RepairInstructions)
 	}
+	for _, want := range []string{
+		"parsed independently; it must be a complete valid stream",
+		"Start the repair response with exactly @report implementation.mdx",
+		"Do not emit @result until every required @payload, @edit, and @cmd frame has already been emitted",
+		"emit nothing after it",
+	} {
+		if !strings.Contains(repaired.RepairInstructions, want) {
+			t.Fatalf("repair instructions missing %q:\n%s", want, repaired.RepairInstructions)
+		}
+	}
 }
 
 func TestSourceEditRepairPacketReferencesDiagnostics(t *testing.T) {
@@ -234,6 +244,69 @@ func TestRunnerContinuesReadyImplementerCommandTurnWithoutEdits(t *testing.T) {
 	}
 	if result.Parsed.Result == nil || result.Parsed.Result.Status != "no-op" {
 		t.Fatalf("parsed result = %#v", result.Parsed.Result)
+	}
+}
+
+func TestRunnerDoesNotContinueCommandTurnWithEdits(t *testing.T) {
+	packet, err := model.BuildPacket(model.PacketInput{
+		TaskID:  "task_1",
+		Role:    model.RoleImplementer,
+		ModelID: "fake-model",
+		Context: "task context",
+		Budget:  stream.DefaultBudget(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := fake.New(
+		fake.Response{Text: strings.Join([]string{
+			"@report implementation.mdx",
+			"Change plus check.",
+			"@payload begin type:patch path:patches/readme.diff",
+			"--- a/README.md",
+			"+++ b/README.md",
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			"@payload end",
+			"@edit file:README.md action:modify mode:patch content:artifact:patches/readme.diff reason:readme-change repo:repo1",
+			"@cmd repo:repo1 -- sed -n '1,20p' README.md",
+			"@result status:ready artifact:implementation.mdx checks:none",
+			"",
+		}, "\n"), Usage: model.Usage{}},
+		fake.Response{Text: "@report implementation.mdx\nThis turn should not be requested.\n@result status:no-op artifact:implementation.mdx checks:none\n", Usage: model.Usage{}},
+	)
+	var commandCalls int
+	result, err := model.Runner{
+		Provider: provider,
+		Store:    artifact.NewStore(filepath.Join(t.TempDir(), "artifacts")),
+		Budget:   stream.DefaultBudget(),
+		CommandHandler: func(ctx context.Context, commands []stream.CommandProposal) (string, error) {
+			commandCalls++
+			t.Fatalf("command handler should not run before source edits are returned: %#v", commands)
+			return "", nil
+		},
+	}.Run(context.Background(), packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commandCalls != 0 {
+		t.Fatalf("command calls = %d, want 0", commandCalls)
+	}
+	if result.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", result.Attempts)
+	}
+	if result.Parsed.Result == nil || result.Parsed.Result.Status != "ready" {
+		t.Fatalf("parsed result = %#v", result.Parsed.Result)
+	}
+	if len(result.Parsed.Edits) != 1 {
+		t.Fatalf("edits = %#v, want 1", result.Parsed.Edits)
+	}
+	if len(result.Parsed.Commands) != 1 {
+		t.Fatalf("commands = %#v, want 1", result.Parsed.Commands)
+	}
+	if len(provider.Packets()) != 1 {
+		t.Fatalf("packets = %d, want 1", len(provider.Packets()))
 	}
 }
 

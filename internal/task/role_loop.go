@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -93,6 +94,7 @@ type roleHistory struct {
 	LatestPlanner    roleStatus
 	HasLatest        bool
 	HasLatestPlanner bool
+	NeedsRework      bool
 }
 
 type roleStatus struct {
@@ -102,9 +104,7 @@ type roleStatus struct {
 }
 
 func (h roleHistory) ResumeFromReviewChangesRequested() bool {
-	return h.HasLatest &&
-		h.Latest.Role == model.RoleReviewer &&
-		h.Latest.Status == string(review.VerdictChangesRequested) &&
+	return h.NeedsRework &&
 		h.HasLatestPlanner &&
 		h.LatestPlanner.Status == "ready"
 }
@@ -125,6 +125,13 @@ func loadRoleHistory(ctx context.Context, root, taskID string) (roleHistory, err
 	}
 	history := roleHistory{RoleCounts: map[model.Role]int{}}
 	for _, event := range events {
+		if event.Type == "feedback.received" {
+			feedback, ok := parseFeedbackReceivedEvent(event.Payload)
+			if ok && feedback.Status == string(review.VerdictChangesRequested) {
+				history.NeedsRework = true
+			}
+			continue
+		}
 		if event.Type != "role.completed" {
 			continue
 		}
@@ -138,6 +145,9 @@ func loadRoleHistory(ctx context.Context, root, taskID string) (roleHistory, err
 		if completed.Role == model.RolePlanner {
 			history.LatestPlanner = completed
 			history.HasLatestPlanner = true
+		}
+		if completed.Role == model.RoleReviewer {
+			history.NeedsRework = completed.Status == string(review.VerdictChangesRequested)
 		}
 	}
 	return history, nil
@@ -255,7 +265,13 @@ func RunRole(ctx context.Context, root, taskID string, role model.Role, opts Run
 		}.Run(ctx, packet)
 		if err != nil {
 			_ = persistRawRoleStream(store, role, run.Raw, true)
-			return RoleRun{}, err
+			var repairErr model.RepairExhaustedError
+			if !errors.As(err, &repairErr) || !completeMissingResultEditTurn(store, role, run.Parsed) {
+				return RoleRun{}, err
+			}
+			if err := recordProtocolFallback(ctx, db, taskID, role, repairErr.ErrorCodes, "completed_missing_result_edit_turn"); err != nil {
+				return RoleRun{}, err
+			}
 		}
 		if err := persistRawRoleStream(store, role, run.Raw, false); err != nil {
 			return RoleRun{}, err
@@ -338,6 +354,82 @@ func roleRunFromModelRun(role model.Role, run model.RunResult, provider model.Pr
 		InputTokens:         inputTokens,
 		OutputTokens:        outputTokens,
 	}
+}
+
+func completeMissingResultEditTurn(store artifact.Store, role model.Role, parsed *stream.ParseResult) bool {
+	if role != model.RoleImplementer ||
+		parsed == nil ||
+		parsed.Result != nil ||
+		len(parsed.Edits) == 0 ||
+		!onlyParserError(parsed.Errors, "missing_result") ||
+		hasRejectedArtifact(parsed.Artifacts) {
+		return false
+	}
+	reportPath, ok := firstReportArtifact(parsed.Artifacts)
+	if !ok {
+		return false
+	}
+	data, err := store.Read(reportPath)
+	if err != nil {
+		return false
+	}
+	rec, err := store.Put(artifact.Record{
+		Path:         reportPath,
+		Type:         artifact.TypeReport,
+		State:        artifact.StateSealed,
+		ProducerRole: role.String(),
+	}, data)
+	if err != nil {
+		return false
+	}
+	for i := range parsed.Artifacts {
+		if parsed.Artifacts[i].Path == reportPath && parsed.Artifacts[i].Type == artifact.TypeReport {
+			parsed.Artifacts[i] = rec
+			break
+		}
+	}
+	parsed.Result = &stream.ResultFrame{
+		Status:   "ready",
+		Artifact: reportPath,
+		Fields: map[string]string{
+			"status":                    "ready",
+			"artifact":                  reportPath,
+			"checks":                    "none",
+			"midgard_protocol_fallback": "missing_result_after_edits",
+		},
+	}
+	parsed.Repair = nil
+	return true
+}
+
+func onlyParserError(errors []stream.ParserError, code string) bool {
+	if len(errors) == 0 {
+		return false
+	}
+	for _, parserErr := range errors {
+		if parserErr.Code != code {
+			return false
+		}
+	}
+	return true
+}
+
+func hasRejectedArtifact(artifacts []artifact.Record) bool {
+	for _, rec := range artifacts {
+		if rec.State == artifact.StateRejected {
+			return true
+		}
+	}
+	return false
+}
+
+func firstReportArtifact(artifacts []artifact.Record) (string, bool) {
+	for _, rec := range artifacts {
+		if rec.Type == artifact.TypeReport && rec.Path != "" {
+			return rec.Path, true
+		}
+	}
+	return "", false
 }
 
 func persistRoleRun(ctx context.Context, db *state.DB, taskID string, role model.Role, run model.RunResult, pricing cost.Pricing) error {
@@ -531,6 +623,19 @@ func recordEmptyImplementationRepairRequested(ctx context.Context, db *state.DB,
 		return err
 	}
 	_, err = db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "implementation.empty_ready_repair_requested", Payload: string(payload)})
+	return err
+}
+
+func recordProtocolFallback(ctx context.Context, db *state.DB, taskID string, role model.Role, errorCodes []string, action string) error {
+	payload, err := json.Marshal(map[string]any{
+		"role":        role.String(),
+		"error_codes": errorCodes,
+		"action":      action,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "role.protocol_fallback", Payload: string(payload)})
 	return err
 }
 

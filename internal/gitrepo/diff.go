@@ -49,6 +49,9 @@ func ApplyPatchWithRejects(ctx context.Context, path string, patch []byte) error
 	if err := ApplyPatch(ctx, path, patch); err == nil {
 		return nil
 	} else {
+		if whitespaceErr := applyPatchIgnoringContextWhitespace(ctx, path, patch); whitespaceErr == nil {
+			return nil
+		}
 		beforeRejects := rejectFileSet(path)
 		out, rejectErr := runApplyPatch(ctx, path, patch, "apply", "--reject", "--whitespace=nowarn", "--recount", "-")
 		rejects := readAndRemoveNewRejectFiles(path, beforeRejects)
@@ -62,6 +65,14 @@ func ApplyPatchWithRejects(ctx context.Context, path string, patch []byte) error
 			Partial: status.Dirty,
 		}
 	}
+}
+
+func applyPatchIgnoringContextWhitespace(ctx context.Context, path string, patch []byte) error {
+	out, err := runApplyPatch(ctx, path, patch, "apply", "--ignore-space-change", "--whitespace=nowarn", "--recount", "-")
+	if err != nil {
+		return &ApplyPatchError{Err: err, Stderr: strings.TrimSpace(out.Stderr)}
+	}
+	return nil
 }
 
 type applyPatchOutput struct {

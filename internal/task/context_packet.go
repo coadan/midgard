@@ -61,6 +61,11 @@ func contextPacket(ctx context.Context, status StatusResult, layout workbench.La
 		b.WriteString("\nlatest_role_statuses:\n")
 		b.WriteString(roleStatuses)
 	}
+	feedback := latestFeedbackContext(ctx, layout, status.Task.ID)
+	if feedback != "" {
+		b.WriteString("\nlatest_feedback:\n")
+		b.WriteString(feedback)
+	}
 	reports := latestReportContext(layout, status.Task.ID)
 	if reports != "" {
 		b.WriteString("\nlatest_role_reports:\n")
@@ -104,6 +109,49 @@ func latestRoleStatusContext(ctx context.Context, layout workbench.Layout, taskI
 			b.WriteString(" artifact:")
 			b.WriteString(completed.Artifact)
 		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func latestFeedbackContext(ctx context.Context, layout workbench.Layout, taskID string) string {
+	db, err := state.Open(ctx, layout.State)
+	if err != nil {
+		return ""
+	}
+	defer db.Close()
+	events, err := db.EventsForTask(ctx, taskID)
+	if err != nil {
+		return ""
+	}
+	var latest feedbackStatus
+	var ok bool
+	for _, event := range events {
+		if event.Type != "feedback.received" {
+			continue
+		}
+		if parsed, parsedOK := parseFeedbackReceivedEvent(event.Payload); parsedOK {
+			latest = parsed
+			ok = true
+		}
+	}
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("status:")
+	b.WriteString(latest.Status)
+	if latest.Source != "" {
+		b.WriteString(" source:")
+		b.WriteString(latest.Source)
+	}
+	b.WriteByte('\n')
+	message := latest.Message
+	if len(message) > maxReportContextBytes {
+		message = message[:maxReportContextBytes] + "\n[feedback truncated]\n"
+	}
+	b.WriteString(message)
+	if !strings.HasSuffix(message, "\n") {
 		b.WriteByte('\n')
 	}
 	return b.String()

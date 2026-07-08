@@ -146,6 +146,43 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			fmt.Fprintf(stdout, "event: %d %s %s\n", event.ID, event.Type, event.Payload)
 		}
 		return nil
+	case "feedback":
+		fs := flag.NewFlagSet("midgard task feedback", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		root := fs.String("root", "", "workbench root or search start")
+		id := fs.String("task", "", "task id")
+		status := fs.String("status", "changes-requested", "feedback status: changes-requested or note")
+		source := fs.String("source", "external", "feedback source")
+		message := fs.String("message", "", "feedback message")
+		messageFile := fs.String("message-file", "", "path to feedback message file")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *id == "" {
+			return fmt.Errorf("task id is required")
+		}
+		text := *message
+		if *messageFile != "" {
+			data, err := os.ReadFile(*messageFile)
+			if err != nil {
+				return err
+			}
+			text = string(data)
+		}
+		start, err := rootOrCWD(*root)
+		if err != nil {
+			return err
+		}
+		if err := midgardtask.RecordFeedback(ctx, start, *id, midgardtask.FeedbackInput{
+			Status:  *status,
+			Source:  *source,
+			Message: text,
+		}); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "task: %s\n", *id)
+		fmt.Fprintf(stdout, "feedback: %s\n", *status)
+		return nil
 	case "step":
 		fs := flag.NewFlagSet("midgard task step", flag.ContinueOnError)
 		fs.SetOutput(stderr)

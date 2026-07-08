@@ -11,6 +11,7 @@ import (
 	"midgard/internal/model"
 	"midgard/internal/model/providers/fake"
 	"midgard/internal/state"
+	"midgard/internal/stream"
 	"midgard/internal/workbench"
 )
 
@@ -239,6 +240,99 @@ func TestRunLoopContinuesImplementerAfterInspectionCommand(t *testing.T) {
 	}
 	if !sawCommand {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestRunLoopCompletesEditTurnWhenMissingResultRepairExhausted(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "missing-result-edit-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_missing_result_edit", Objective: "change README heading"}); err != nil {
+		t.Fatal(err)
+	}
+
+	implementerStream := strings.Join([]string{
+		"@report implementation.mdx",
+		"# Implementation",
+		"",
+		"Prepared the requested README patch.",
+		"@payload begin type:patch path:patches/readme-missing-result.diff",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1 +1 @@",
+		"-# fixture",
+		"+# materialized missing result",
+		"@payload end",
+		"@edit file:README.md action:modify mode:patch content:artifact:patches/readme-missing-result.diff reason:readme-change repo:repo1",
+		"@cmd repo:repo1 -- git diff --check",
+		"",
+	}, "\n")
+	budget := stream.DefaultBudget()
+	budget.MaxRepairAttempts = 0
+	implementer := fake.New(fake.Response{
+		Text:  implementerStream,
+		Usage: model.Usage{InputTokens: 20, OutputTokens: 30},
+	})
+	result, err := RunLoop(ctx, root, "task_missing_result_edit", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RolePlanner: fake.New(fake.Response{
+				Text: "@report plan.mdx\n# Plan\n\nModify README.\n@result status:ready artifact:plan.mdx checks:none\n",
+			}),
+			model.RoleImplementer: implementer,
+			model.RoleReviewer: fake.New(fake.Response{
+				Text: "@report review.mdx\n# Review\n\nApproved.\n@result status:approved artifact:review.mdx findings:none\n",
+			}),
+		},
+		Budget: budget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "completed" || len(result.RoleRuns) != 3 {
+		t.Fatalf("result = %#v", result)
+	}
+	if result.RoleRuns[1].Status != "ready" {
+		t.Fatalf("implementer status = %s, want ready", result.RoleRuns[1].Status)
+	}
+	if implementer.Calls() != 1 {
+		t.Fatalf("implementer calls = %d, want 1", implementer.Calls())
+	}
+	patch, err := os.ReadFile(filepath.Join(root, ".midgard", "artifacts", "task_missing_result_edit", "patch.diff"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patch), "materialized missing result") {
+		t.Fatalf("patch.diff:\n%s", patch)
+	}
+	db, err := state.Open(ctx, filepath.Join(root, ".midgard", "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events, err := db.EventsForTask(ctx, "task_missing_result_edit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawFallback, sawEdit, sawCommand bool
+	for _, event := range events {
+		switch event.Type {
+		case "role.protocol_fallback":
+			sawFallback = strings.Contains(event.Payload, "completed_missing_result_edit_turn")
+		case "source_edit.applied":
+			sawEdit = strings.Contains(event.Payload, "README.md")
+		case "command.finished":
+			sawCommand = strings.Contains(event.Payload, "git diff --check")
+		}
+	}
+	if !sawFallback || !sawEdit || !sawCommand {
+		t.Fatalf("events = %#v, want fallback, source edit, and command", events)
 	}
 }
 
@@ -944,6 +1038,101 @@ func TestRunLoopResumesFromChangesRequestedReview(t *testing.T) {
 	}
 	if !sawResume {
 		t.Fatalf("events = %#v, want rework.resumed", events)
+	}
+}
+
+func TestRunLoopResumesFromExternalFeedback(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "feedback-resume-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_feedback_resume", Objective: "replace README heading"}); err != nil {
+		t.Fatal(err)
+	}
+	patch := strings.Join([]string{
+		"@report implementation.mdx",
+		"# Implementation",
+		"@payload begin type:patch path:patches/readme.diff",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1 +1 @@",
+		"-# fixture",
+		"+# first",
+		"@payload end",
+		"@edit file:README.md action:modify mode:patch content:artifact:patches/readme.diff reason:first-pass repo:repo1",
+		"@result status:ready artifact:implementation.mdx checks:none",
+		"",
+	}, "\n")
+	firstResult, err := RunLoop(ctx, root, "task_feedback_resume", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RolePlanner:     fake.New(fake.Response{Text: "@report plan.mdx\n# Plan\n\nModify README.\n@result status:ready artifact:plan.mdx checks:none\n"}),
+			model.RoleImplementer: fake.New(fake.Response{Text: patch}),
+			model.RoleReviewer:    fake.New(fake.Response{Text: "@report review.mdx\n# Review\n\nApproved.\n@result status:approved artifact:review.mdx findings:none\n"}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstResult.State != "completed" {
+		t.Fatalf("first state = %s, want completed", firstResult.State)
+	}
+	if err := RecordFeedback(ctx, root, "task_feedback_resume", FeedbackInput{
+		Status:  "changes-requested",
+		Source:  "validation",
+		Message: "focused test failed: Unable to resolve symbol: helper",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fixPatch := strings.Join([]string{
+		"@report implementation.mdx",
+		"# Implementation",
+		"Fixed the validation feedback.",
+		"@payload begin type:patch path:patches/readme-feedback-fix.diff",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1 +1 @@",
+		"-# first",
+		"+# final",
+		"@payload end",
+		"@edit file:README.md action:modify mode:patch content:artifact:patches/readme-feedback-fix.diff reason:feedback-fix repo:repo1",
+		"@result status:ready artifact:implementation.mdx checks:none",
+		"",
+	}, "\n")
+	implementer := fake.New(fake.Response{Text: fixPatch})
+	secondResult, err := RunLoop(ctx, root, "task_feedback_resume", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RoleImplementer: implementer,
+			model.RoleReviewer:    fake.New(fake.Response{Text: "@report review.mdx\n# Review\n\nApproved.\n@result status:approved artifact:review.mdx findings:none\n"}),
+		},
+		MaxReviewCycles: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondResult.State != "completed" {
+		t.Fatalf("second state = %s, want completed", secondResult.State)
+	}
+	if len(secondResult.RoleRuns) != 2 ||
+		secondResult.RoleRuns[0].Role != model.RoleImplementer ||
+		secondResult.RoleRuns[1].Role != model.RoleReviewer {
+		t.Fatalf("second role runs = %#v, want implementer then reviewer", secondResult.RoleRuns)
+	}
+	packets := implementer.Packets()
+	if len(packets) != 1 {
+		t.Fatalf("implementer packets = %d, want 1", len(packets))
+	}
+	if !strings.Contains(packets[0].Context, "latest_feedback") ||
+		!strings.Contains(packets[0].Context, "source:validation") ||
+		!strings.Contains(packets[0].Context, "Unable to resolve symbol") ||
+		!strings.Contains(packets[0].Context, "+# first") {
+		t.Fatalf("resume implementer context missing feedback or diff:\n%s", packets[0].Context)
 	}
 }
 

@@ -113,6 +113,53 @@ func TestApplyPatchWithRejectsKeepsPartialApplication(t *testing.T) {
 	}
 }
 
+func TestApplyPatchWithRejectsIgnoresContextWhitespaceDrift(t *testing.T) {
+	ctx := context.Background()
+	repo := initTestRepo(t)
+	original := strings.Join([]string{
+		"                        not-empty))",
+		"              connections)))",
+		"",
+		"(defn- without-nil-values",
+		"  [m]",
+		"  (into {} (remove (comp nil? val)) m))",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := ApplyPatchWithRejects(ctx, repo, []byte(`--- a/README.md
++++ b/README.md
+@@ -1,6 +1,11 @@
+                          not-empty))
+                connections)))
+ 
+-(defn- without-nil-values
++(defn- installer-facing-primary-display-connection-slot
++  [display-slots primary-display-connection-slot]
++  (when (contains? display-slots primary-display-connection-slot)
++    primary-display-connection-slot))
++
++(defn- without-nil-values
+   [m]
+   (into {} (remove (comp nil? val)) m))
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(repo, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "installer-facing-primary-display-connection-slot") {
+		t.Fatalf("README.md missing inserted helper:\n%s", got)
+	}
+	if !strings.Contains(got, "              connections)))") {
+		t.Fatalf("README.md context whitespace changed unexpectedly:\n%s", got)
+	}
+}
+
 func initTestRepo(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
