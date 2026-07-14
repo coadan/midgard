@@ -1,0 +1,7 @@
+@report plan.mdx
+
+## Plan: Fix duplicated article in LocalDate comment
+
+Update `unstable/kind.go` and run `go test ./...`.
+
+@result status:ready checks:go-test

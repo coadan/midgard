@@ -17,9 +17,13 @@ type CreateResult struct {
 }
 
 type StatusResult struct {
-	Task       state.Task
-	Worktrees  []WorktreeStatus
-	NextAction string
+	Task          state.Task
+	Worktrees     []WorktreeStatus
+	NextAction    string
+	ForgeGates    bool
+	ForgeReady    bool
+	ForgeBlockers []string
+	ForgeWarnings []string
 }
 
 type WorktreeStatus struct {

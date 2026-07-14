@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	midgardforge "midgard/internal/forge"
 	"midgard/internal/gitrepo"
 	"midgard/internal/state"
 	"midgard/internal/workbench"
@@ -155,7 +156,19 @@ func Status(ctx context.Context, root, taskID string) (StatusResult, error) {
 			Porcelain:   status.Porcelain,
 		})
 	}
-	return StatusResult{Task: taskRow, Worktrees: worktrees, NextAction: nextAction(worktrees)}, nil
+	readiness, err := midgardforge.Readiness(ctx, status.Root, taskID)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	next := nextAction(taskRow.State, worktrees)
+	if readiness.Enabled && !readiness.Ready {
+		next = "resolve-forge-blockers"
+	}
+	return StatusResult{
+		Task: taskRow, Worktrees: worktrees, NextAction: next,
+		ForgeGates: readiness.Enabled, ForgeReady: readiness.Ready,
+		ForgeBlockers: readiness.Blockers, ForgeWarnings: readiness.Warnings,
+	}, nil
 }
 
 func Diff(ctx context.Context, root, taskID, repoID string) (string, error) {

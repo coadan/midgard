@@ -17,7 +17,7 @@ func (db *DB) InsertUsageRecord(ctx context.Context, usage UsageRecord) error {
 	if usage.RawPayload == "" {
 		usage.RawPayload = "{}"
 	}
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := db.fencedExecContext(ctx, `
 INSERT INTO usage_records (id, task_id, provider_id, model_id, role, input_tokens, output_tokens, raw_payload)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		usage.ID,

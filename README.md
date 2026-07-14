@@ -81,6 +81,66 @@ go run ./cmd/midgard artifact list --root /path/to/workbench --task task_demo
 go run ./cmd/midgard task stream --root /path/to/workbench --task task_demo
 ```
 
+## Read-Only GitHub Forge
+
+Link a registered repo to its GitHub identity, then associate one or more pull
+requests with a task:
+
+```sh
+go run ./cmd/midgard forge repo link \
+  --root /path/to/workbench \
+  --repo repo1 \
+  --remote owner/project \
+  --default-branch main
+
+go run ./cmd/midgard forge auth status \
+  --root /path/to/workbench \
+  --account github-main
+
+go run ./cmd/midgard task pr link \
+  --root /path/to/workbench \
+  --task task_demo \
+  --repo repo1 \
+  --account github-main \
+  --pr 42
+
+go run ./cmd/midgard task pr refresh \
+  --root /path/to/workbench \
+  --task task_demo
+```
+
+Authentication is discovered from `GH_TOKEN`, `GITHUB_TOKEN`, or the GitHub
+CLI. `--auth-profile anonymous`, `env:VARIABLE`, or `gh:HOST` makes the source
+explicit. Midgard stores only the profile reference and never the token.
+Anonymous refreshes cannot inspect review threads, so readiness reports their
+state as unknown rather than assuming there are none.
+
+Each refresh writes immutable pull, check, review, thread, and normalized
+snapshot JSON under the task artifact tree. SQLite holds the latest queryable
+projection. Inspect it without another network request:
+
+```sh
+go run ./cmd/midgard task pr list --root /path/to/workbench --task task_demo
+go run ./cmd/midgard task pr status --root /path/to/workbench --task task_demo
+go run ./cmd/midgard task pr status --root /path/to/workbench --task task_demo --for-agent
+go run ./cmd/midgard task pr checks --root /path/to/workbench --task task_demo --repo repo1 --pr 42
+go run ./cmd/midgard task pr threads --root /path/to/workbench --task task_demo --repo repo1 --pr 42
+```
+
+Forge readiness is warning-only by default. Enable close/readiness blockers in
+`.midgard/workbench.toml`:
+
+```toml
+[forge]
+readiness_gates = true
+max_snapshot_age = "15m"
+```
+
+With gates enabled, stale or missing snapshots, open or unmerged PRs, failing
+checks, incomplete or unresolved review threads, review blockers, unexpected
+base branches, and worktree head mismatches make task status report
+`resolve-forge-blockers`.
+
 ## OSS Merged-PR Benchmarks
 
 Benchmark suites prepare isolated source checkouts, create task worktrees, run
@@ -107,6 +167,14 @@ Minimal manifest:
       "objective": "Apply the README wording change from the merged PR.",
       "task_id": "task_doc_wording_001",
       "repo_ids": ["repo1"],
+      "acceptance_checks": [
+        {
+          "id": "tests",
+          "repo_id": "repo1",
+          "command": "go test ./...",
+          "timeout_seconds": 300
+        }
+      ],
       "expected_touched_files": ["README.md"],
       "hidden_reference_patch": "references/doc-wording-001.patch",
       "hidden_reference_prs": [
@@ -129,6 +197,7 @@ Run the benchmark end-to-end:
 go run ./cmd/midgard benchmark import-pr \
   --repo https://github.com/owner/project \
   --pr 123 \
+  --check "go test ./..." \
   --out /path/to/benchmarks/pr-123.json
 
 go run ./cmd/midgard benchmark run \
@@ -140,15 +209,70 @@ go run ./cmd/midgard benchmark run \
   --max-output-tokens 4096
 ```
 
+Benchmark runs are durable and resume by default. Midgard records the manifest,
+provider/model options, repository base commits, item order, task identity, and
+each item's current phase in SQLite. A resumed run skips completed role work,
+reuses current acceptance evidence, and reruns only unfinished roles or missing,
+stale, or tampered acceptance evidence. The CLI prints the stable run ID and an
+`action:created`, `action:resumed`, or `action:reused` marker for every item.
+
+Task and benchmark execution is single-writer. Midgard acquires an atomic
+SQLite execution lease before provider calls, commands, acceptance checks,
+feedback, cleanup, forge refreshes, or report generation. Active leases renew
+every 10 seconds with a 30-second expiry and carry a monotonically increasing
+fence. Competing processes exit before doing work and report the current owner,
+fence, acquisition time, and expiry. `SIGINT` and `SIGTERM` release ownership
+immediately; after an ungraceful process death, another process can reclaim the
+resource when the lease expires.
+
+Execution state writes validate every nested benchmark and task fence inside
+the same SQLite transaction as the mutation. Provider streams and command
+results also recheck ownership before materializing artifacts, so an expired
+owner cannot commit evidence after a higher-fence process takes over.
+
+Manifest, execution-option, and base-commit drift is rejected before provider
+calls. To intentionally discard the existing run and its task attempts, start a
+new run explicitly:
+
+```sh
+go run ./cmd/midgard benchmark run \
+  --root /path/to/benchmark-workbench \
+  --manifest /path/to/benchmarks/pr-123.json \
+  --provider deepseek \
+  --reset
+```
+
 `import-pr` fetches GitHub PR metadata, writes a hidden reference patch under
 `references/`, fills in `checkout_ref`, `hidden_reference_prs`,
 `expected_touched_files`, and creates a default task objective from the PR title
 and body. Set `GITHUB_TOKEN` or `GH_TOKEN` for private repositories or higher
 GitHub API limits.
 
+Legacy string entries under `checks` and structured `acceptance_checks` are
+authoritative: Midgard executes them after the role loop instead of trusting a
+model-authored result. Structured checks can select a repo, relative working
+directory, timeout, and `hidden` worker-context visibility. Each check runs in
+its own disposable snapshot with a restricted read-only command policy and
+bounded output. The immutable summary records the exact patch checksum,
+worktree fingerprints, exit status, timeout/truncation state, and sealed output
+artifacts in SQLite.
+
+A completed candidate cannot score `pass` when required acceptance evidence is
+missing, stale, tampered, or failing. Reference-patch similarity remains a
+diagnostic when authoritative checks pass, allowing behaviorally correct
+alternative implementations. Rerun checks without another provider call:
+
+```sh
+go run ./cmd/midgard benchmark verify \
+  --root /path/to/benchmark-workbench \
+  --manifest /path/to/benchmarks/pr-123.json \
+  --acceptance-timeout 5m
+```
+
 The public report includes task state, score, cost, touched files, provider
-fingerprints, and artifact refs. Hidden PR metadata and reference patch paths
-are written only to the `*-reference-evidence.json` sidecar.
+fingerprints, durable benchmark run identity/status, and artifact refs. Hidden
+PR metadata and reference patch paths are written only to the
+`*-reference-evidence.json` sidecar.
 
 To regenerate the report from existing task state without running a provider:
 

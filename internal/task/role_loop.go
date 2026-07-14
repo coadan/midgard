@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -24,7 +25,20 @@ import (
 
 const defaultMaxReviewCycles = 4
 
-func RunLoop(ctx context.Context, root, taskID string, opts RunnerOptions) (LoopResult, error) {
+func RunLoop(ctx context.Context, root, taskID string, opts RunnerOptions) (result LoopResult, retErr error) {
+	execution, err := AcquireExecution(ctx, root, taskID)
+	if err != nil {
+		return LoopResult{}, err
+	}
+	defer func() {
+		if err := execution.Close(); retErr == nil && err != nil {
+			retErr = err
+		}
+	}()
+	return runLoop(execution.Context, root, taskID, opts)
+}
+
+func runLoop(ctx context.Context, root, taskID string, opts RunnerOptions) (LoopResult, error) {
 	var loop LoopResult
 	maxReviewCycles := opts.MaxReviewCycles
 	if maxReviewCycles <= 0 {
@@ -34,45 +48,48 @@ func RunLoop(ctx context.Context, root, taskID string, opts RunnerOptions) (Loop
 	if err != nil {
 		return loop, err
 	}
-	roleCounts := history.RoleCounts
-	if !history.ResumeFromReviewChangesRequested() {
+	nextRole := history.NextRole()
+	if nextRole == model.RolePlanner {
 		plannerRun, err := RunRole(ctx, root, taskID, model.RolePlanner, opts)
-		if err != nil {
-			return loop, err
+		if plannerRun.Role != "" {
+			loop.RoleRuns = append(loop.RoleRuns, plannerRun)
 		}
-		loop.RoleRuns = append(loop.RoleRuns, plannerRun)
-		if err := snapshotRoleAttempt(root, taskID, plannerRun, nextRoleCount(roleCounts, model.RolePlanner)); err != nil {
-			return loop, err
+		if err != nil {
+			return finishErroredLoop(ctx, root, taskID, loop, err)
 		}
 		if plannerRun.Status != "ready" {
-			return finishLoop(ctx, root, taskID, opts, loop)
+			return finishLoop(ctx, root, taskID, loop)
 		}
-	} else if err := recordReworkResumed(ctx, root, taskID, maxReviewCycles); err != nil {
-		return loop, err
+		nextRole = model.RoleImplementer
+	} else if history.ResumeFromReviewChangesRequested() {
+		if err := recordReworkResumed(ctx, root, taskID, maxReviewCycles); err != nil {
+			return loop, err
+		}
 	}
+	if nextRole == "" {
+		return finishLoop(ctx, root, taskID, loop)
+	}
+	startWithReviewer := nextRole == model.RoleReviewer
 	for cycle := 1; cycle <= maxReviewCycles; cycle++ {
-		implementerRun, err := RunRole(ctx, root, taskID, model.RoleImplementer, opts)
-		if err != nil {
-			return loop, err
+		if !startWithReviewer {
+			implementerRun, err := RunRole(ctx, root, taskID, model.RoleImplementer, opts)
+			if implementerRun.Role != "" {
+				loop.RoleRuns = append(loop.RoleRuns, implementerRun)
+			}
+			if err != nil {
+				return finishErroredLoop(ctx, root, taskID, loop, err)
+			}
+			if implementerRun.Status != "ready" && implementerRun.Status != "no-op" {
+				break
+			}
 		}
-		loop.RoleRuns = append(loop.RoleRuns, implementerRun)
-		if err := snapshotRoleAttempt(root, taskID, implementerRun, nextRoleCount(roleCounts, model.RoleImplementer)); err != nil {
-			return loop, err
-		}
-		if implementerRun.Status != "ready" && implementerRun.Status != "no-op" {
-			break
-		}
+		startWithReviewer = false
 		reviewerRun, err := RunRole(ctx, root, taskID, model.RoleReviewer, opts)
-		if err != nil {
-			return loop, err
+		if reviewerRun.Role != "" {
+			loop.RoleRuns = append(loop.RoleRuns, reviewerRun)
 		}
-		reviewerRun, err = applyReviewGuards(ctx, root, taskID, reviewerRun)
 		if err != nil {
-			return loop, err
-		}
-		loop.RoleRuns = append(loop.RoleRuns, reviewerRun)
-		if err := snapshotRoleAttempt(root, taskID, reviewerRun, nextRoleCount(roleCounts, model.RoleReviewer)); err != nil {
-			return loop, err
+			return finishErroredLoop(ctx, root, taskID, loop, err)
 		}
 		if reviewerRun.Status == string(review.VerdictApproved) {
 			break
@@ -85,16 +102,18 @@ func RunLoop(ctx context.Context, root, taskID string, opts RunnerOptions) (Loop
 		}
 		break
 	}
-	return finishLoop(ctx, root, taskID, opts, loop)
+	return finishLoop(ctx, root, taskID, loop)
 }
 
 type roleHistory struct {
-	RoleCounts       map[model.Role]int
-	Latest           roleStatus
-	LatestPlanner    roleStatus
-	HasLatest        bool
-	HasLatestPlanner bool
-	NeedsRework      bool
+	RoleCounts           map[model.Role]int
+	Latest               roleStatus
+	LatestPlanner        roleStatus
+	LatestImplementer    roleStatus
+	HasLatest            bool
+	HasLatestPlanner     bool
+	HasLatestImplementer bool
+	NeedsRework          bool
 }
 
 type roleStatus struct {
@@ -107,6 +126,37 @@ func (h roleHistory) ResumeFromReviewChangesRequested() bool {
 	return h.NeedsRework &&
 		h.HasLatestPlanner &&
 		h.LatestPlanner.Status == "ready"
+}
+
+func (h roleHistory) NextRole() model.Role {
+	if h.ResumeFromReviewChangesRequested() {
+		return model.RoleImplementer
+	}
+	if !h.HasLatest {
+		return model.RolePlanner
+	}
+	switch h.Latest.Role {
+	case model.RolePlanner:
+		if h.Latest.Status == "ready" {
+			return model.RoleImplementer
+		}
+		return model.RolePlanner
+	case model.RoleImplementer:
+		if h.Latest.Status == "ready" || h.Latest.Status == "no-op" {
+			return model.RoleReviewer
+		}
+		return model.RoleImplementer
+	case model.RoleReviewer:
+		if h.Latest.Status == string(review.VerdictApproved) {
+			return ""
+		}
+		if h.Latest.Status == string(review.VerdictChangesRequested) {
+			return model.RoleImplementer
+		}
+		return model.RoleReviewer
+	default:
+		return model.RolePlanner
+	}
 }
 
 func loadRoleHistory(ctx context.Context, root, taskID string) (roleHistory, error) {
@@ -146,6 +196,10 @@ func loadRoleHistory(ctx context.Context, root, taskID string) (roleHistory, err
 			history.LatestPlanner = completed
 			history.HasLatestPlanner = true
 		}
+		if completed.Role == model.RoleImplementer {
+			history.LatestImplementer = completed
+			history.HasLatestImplementer = true
+		}
 		if completed.Role == model.RoleReviewer {
 			history.NeedsRework = completed.Status == string(review.VerdictChangesRequested)
 		}
@@ -174,7 +228,10 @@ func parseRoleCompletedEvent(payload string) (roleStatus, bool) {
 	}, true
 }
 
-func finishLoop(ctx context.Context, root, taskID string, opts RunnerOptions, loop LoopResult) (LoopResult, error) {
+func finishLoop(ctx context.Context, root, taskID string, loop LoopResult) (LoopResult, error) {
+	if err := CheckExecution(ctx); err != nil {
+		return loop, err
+	}
 	status, err := Status(ctx, root, taskID)
 	if err != nil {
 		return loop, err
@@ -183,21 +240,57 @@ func finishLoop(ctx context.Context, root, taskID string, opts RunnerOptions, lo
 	if err != nil {
 		return loop, err
 	}
-	finalState := finalState(loop.RoleRuns, patchHasContent)
+	history, err := loadRoleHistory(ctx, root, taskID)
+	if err != nil {
+		return loop, err
+	}
+	finalState := finalState(history, patchHasContent)
 	if err := updateTaskState(ctx, root, taskID, finalState); err != nil {
 		return loop, err
 	}
 	loop.TaskID = taskID
 	loop.State = finalState
 	loop.PatchPath = patchPath
-	loop.CostUSD = sumCost(loop.RoleRuns, opts.Pricing)
+	loop.CostUSD, loop.CostCaveats, err = taskCostSummary(ctx, root, taskID)
+	if err != nil {
+		return loop, err
+	}
 	if err := appendTaskRunSummary(ctx, root, taskID, loop); err != nil {
 		return loop, err
 	}
 	return loop, nil
 }
 
-func RunRole(ctx context.Context, root, taskID string, role model.Role, opts RunnerOptions) (RoleRun, error) {
+func finishErroredLoop(ctx context.Context, root, taskID string, loop LoopResult, runErr error) (LoopResult, error) {
+	if err := CheckExecution(ctx); err != nil {
+		return loop, errors.Join(runErr, err)
+	}
+	status, err := Status(ctx, root, taskID)
+	if err != nil {
+		return loop, errors.Join(runErr, err)
+	}
+	patchPath, _, err := writePatch(ctx, root, taskID, status.Worktrees)
+	if err != nil {
+		return loop, errors.Join(runErr, err)
+	}
+	loop.TaskID = taskID
+	loop.State = status.Task.State
+	loop.PatchPath = patchPath
+	loop.Error = runErr.Error()
+	loop.CostUSD, loop.CostCaveats, err = taskCostSummary(ctx, root, taskID)
+	if err != nil {
+		return loop, errors.Join(runErr, err)
+	}
+	if err := appendTaskRunSummary(ctx, root, taskID, loop); err != nil {
+		return loop, errors.Join(runErr, err)
+	}
+	return loop, runErr
+}
+
+func RunRole(ctx context.Context, root, taskID string, role model.Role, opts RunnerOptions) (result RoleRun, retErr error) {
+	if err := CheckExecution(ctx); err != nil {
+		return RoleRun{}, err
+	}
 	provider := opts.Providers[role]
 	if provider == nil {
 		return RoleRun{}, fmt.Errorf("provider missing for role %s", role)
@@ -212,9 +305,16 @@ func RunRole(ctx context.Context, root, taskID string, role model.Role, opts Run
 		return RoleRun{}, err
 	}
 	defer db.Close()
-	if _, err := grantLease(ctx, db, taskID, role); err != nil {
+	execution, err := acquireExecutionWithDB(ctx, db, taskID)
+	if err != nil {
 		return RoleRun{}, err
 	}
+	defer func() {
+		if err := execution.Close(); retErr == nil && err != nil {
+			retErr = err
+		}
+	}()
+	ctx = execution.Context
 	budget := opts.Budget
 	if budget == (stream.Budget{}) {
 		budget = stream.DefaultBudget()
@@ -229,15 +329,22 @@ func RunRole(ctx context.Context, root, taskID string, role model.Role, opts Run
 	var allUsage []model.Usage
 	var totalAttempts int
 	for {
+		if err := CheckExecution(ctx); err != nil {
+			return RoleRun{}, err
+		}
 		taskStatus, err := Status(ctx, wbStatus.Root, taskID)
 		if err != nil {
 			return RoleRun{}, err
+		}
+		packetContext := contextPacket(ctx, taskStatus, layout)
+		if strings.TrimSpace(opts.ExternalContext) != "" {
+			packetContext += "\nexternal_task_context:\n" + strings.TrimSpace(opts.ExternalContext) + "\n"
 		}
 		packet, err := model.BuildPacket(model.PacketInput{
 			TaskID:  taskID,
 			Role:    role,
 			ModelID: opts.ModelID,
-			Context: contextPacket(ctx, taskStatus, layout),
+			Context: packetContext,
 			Budget:  budget,
 		})
 		if err != nil {
@@ -259,32 +366,50 @@ func RunRole(ctx context.Context, root, taskID string, role model.Role, opts Run
 				db,
 				layout,
 				taskID,
+				role,
 				taskStatus.Worktrees,
 				store,
 			),
+			Fence: CheckExecution,
 		}.Run(ctx, packet)
+		if fenceErr := CheckExecution(ctx); fenceErr != nil {
+			return RoleRun{}, fenceErr
+		}
 		if err != nil {
-			_ = persistRawRoleStream(store, role, run.Raw, true)
+			_ = persistRawRoleStream(ctx, store, role, run.Raw, true)
 			var repairErr model.RepairExhaustedError
 			if !errors.As(err, &repairErr) || !completeMissingResultEditTurn(store, role, run.Parsed) {
-				return RoleRun{}, err
+				failed := roleRunFromModelRun(role, run, provider, opts.ModelID, append(allUsage, run.Usage...), totalAttempts+run.Attempts)
+				failed.Status = "failed"
+				if run.Parsed != nil {
+					if persistErr := persistRoleAttempt(ctx, db, taskID, role, run, opts.Pricing); persistErr != nil {
+						return failed, errors.Join(err, persistErr)
+					}
+				}
+				if recordErr := recordRoleFailed(ctx, db, taskID, failed, err); recordErr != nil {
+					return failed, errors.Join(err, recordErr)
+				}
+				return failed, err
 			}
 			if err := recordProtocolFallback(ctx, db, taskID, role, repairErr.ErrorCodes, "completed_missing_result_edit_turn"); err != nil {
 				return RoleRun{}, err
 			}
 		}
-		if err := persistRawRoleStream(store, role, run.Raw, false); err != nil {
+		if err := persistRawRoleStream(ctx, store, role, run.Raw, false); err != nil {
 			return RoleRun{}, err
 		}
-		if err := appendRoleReportProvenance(store, run, provider, opts.ModelID, packet); err != nil {
+		if err := appendRoleReportProvenance(ctx, store, run, provider, opts.ModelID, packet); err != nil {
 			return RoleRun{}, err
 		}
-		if err := persistRoleRun(ctx, db, taskID, role, run, opts.Pricing); err != nil {
+		if err := persistRoleAttempt(ctx, db, taskID, role, run, opts.Pricing); err != nil {
 			return RoleRun{}, err
 		}
 		allUsage = append(allUsage, run.Usage...)
 		totalAttempts += run.Attempts
 		sourceEditAttempt := sourceEditFailures + 1
+		if err := CheckExecution(ctx); err != nil {
+			return RoleRun{}, err
+		}
 		failure, err := applySourceEdits(ctx, db, taskID, role, taskStatus.Worktrees, store, run.Parsed, sourceEditAttempt, maxSourceEditRepairs)
 		if err != nil {
 			return RoleRun{}, err
@@ -301,7 +426,10 @@ func RunRole(ctx context.Context, root, taskID string, role model.Role, opts Run
 			return RoleRun{}, fmt.Errorf("source edit apply repairs exhausted after %d retries: %w", maxSourceEditRepairs, failure)
 		}
 		for _, proposal := range run.Parsed.Commands {
-			if _, err := executeProposal(ctx, db, layout, taskID, taskStatus.Worktrees, proposal); err != nil {
+			if err := CheckExecution(ctx); err != nil {
+				return RoleRun{}, err
+			}
+			if _, err := executeProposal(ctx, db, layout, taskID, role, taskStatus.Worktrees, proposal); err != nil {
 				return RoleRun{}, err
 			}
 		}
@@ -324,16 +452,94 @@ func RunRole(ctx context.Context, root, taskID string, role model.Role, opts Run
 			}
 			blocked := roleRunFromModelRun(role, run, provider, opts.ModelID, allUsage, totalAttempts)
 			blocked.Status = "blocked"
-			return blocked, nil
+			return acceptRoleRun(ctx, root, taskID, db, store, run, blocked)
 		}
-		return roleRunFromModelRun(role, run, provider, opts.ModelID, allUsage, totalAttempts), nil
+		accepted := roleRunFromModelRun(role, run, provider, opts.ModelID, allUsage, totalAttempts)
+		if err := CheckExecution(ctx); err != nil {
+			return RoleRun{}, err
+		}
+		return acceptRoleRun(ctx, root, taskID, db, store, run, accepted)
 	}
+}
+
+func acceptRoleRun(ctx context.Context, root, taskID string, db *state.DB, store artifact.Store, run model.RunResult, accepted RoleRun) (RoleRun, error) {
+	if err := CheckExecution(ctx); err != nil {
+		return RoleRun{}, err
+	}
+	guarded, err := applyReviewGuards(ctx, root, taskID, accepted)
+	if err != nil {
+		return RoleRun{}, err
+	}
+	if err := refreshRoleReportArtifact(ctx, db, taskID, store, guarded); err != nil {
+		return RoleRun{}, err
+	}
+	history, err := loadRoleHistory(ctx, root, taskID)
+	if err != nil {
+		return RoleRun{}, err
+	}
+	if err := snapshotRoleAttempt(ctx, root, taskID, guarded, history.RoleCounts[guarded.Role]+1); err != nil {
+		return RoleRun{}, err
+	}
+	if err := recordRoleCompleted(ctx, db, taskID, run, guarded); err != nil {
+		return RoleRun{}, err
+	}
+	return guarded, nil
+}
+
+func refreshRoleReportArtifact(ctx context.Context, db *state.DB, taskID string, store artifact.Store, run RoleRun) error {
+	if run.Artifact == "" {
+		return nil
+	}
+	if err := CheckExecution(ctx); err != nil {
+		return err
+	}
+	data, err := store.Read(run.Artifact)
+	if err != nil {
+		return err
+	}
+	rec, err := store.Put(artifact.Record{
+		Path:         run.Artifact,
+		Type:         artifact.TypeReport,
+		State:        artifact.StateSealed,
+		ProducerRole: run.Role.String(),
+	}, data)
+	if err != nil {
+		return err
+	}
+	return db.UpdateArtifact(ctx, state.Artifact{
+		ID:           artifactID(taskID, rec.Path),
+		TaskID:       taskID,
+		Type:         rec.Type,
+		Path:         rec.Path,
+		Checksum:     rec.Checksum,
+		ProducerRole: run.Role.String(),
+		State:        rec.State,
+	})
+}
+
+func recordRoleCompleted(ctx context.Context, db *state.DB, taskID string, run model.RunResult, accepted RoleRun) error {
+	if run.Parsed == nil || run.Parsed.Result == nil {
+		return fmt.Errorf("accepted role %s has no result frame", accepted.Role)
+	}
+	result := *run.Parsed.Result
+	result.Status = accepted.Status
+	result.Artifact = accepted.Artifact
+	payload, err := json.Marshal(map[string]any{
+		"role":     accepted.Role.String(),
+		"status":   result,
+		"attempts": accepted.Attempts,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "role.completed", Payload: string(payload)})
+	return err
 }
 
 func roleRunFromModelRun(role model.Role, run model.RunResult, provider model.Provider, modelID string, usage []model.Usage, attempts int) RoleRun {
 	status := ""
 	artifactPath := ""
-	if run.Parsed.Result != nil {
+	if run.Parsed != nil && run.Parsed.Result != nil {
 		status = run.Parsed.Result.Status
 		artifactPath = run.Parsed.Result.Artifact
 	}
@@ -354,6 +560,31 @@ func roleRunFromModelRun(role model.Role, run model.RunResult, provider model.Pr
 		InputTokens:         inputTokens,
 		OutputTokens:        outputTokens,
 	}
+}
+
+func recordRoleFailed(ctx context.Context, db *state.DB, taskID string, failed RoleRun, runErr error) error {
+	payload, err := json.Marshal(map[string]any{
+		"role": failed.Role.String(), "status": failed.Status, "artifact": failed.Artifact,
+		"attempts": failed.Attempts, "input_tokens": failed.InputTokens, "output_tokens": failed.OutputTokens,
+		"provider_id": failed.ProviderID, "model_id": failed.ModelID, "error": runErr.Error(),
+		"failure_class": roleFailureClass(runErr),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "role.failed", Payload: string(payload)})
+	return err
+}
+
+func roleFailureClass(runErr error) string {
+	var protocolErr model.RepairExhaustedError
+	if errors.As(runErr, &protocolErr) {
+		return "protocol"
+	}
+	if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runErr, context.Canceled) {
+		return "canceled"
+	}
+	return "runtime"
 }
 
 func completeMissingResultEditTurn(store artifact.Store, role model.Role, parsed *stream.ParseResult) bool {
@@ -432,7 +663,7 @@ func firstReportArtifact(artifacts []artifact.Record) (string, bool) {
 	return "", false
 }
 
-func persistRoleRun(ctx context.Context, db *state.DB, taskID string, role model.Role, run model.RunResult, pricing cost.Pricing) error {
+func persistRoleAttempt(ctx context.Context, db *state.DB, taskID string, role model.Role, run model.RunResult, pricing cost.Pricing) error {
 	for _, rec := range run.Parsed.Artifacts {
 		stateArtifact := state.Artifact{
 			ID:           artifactID(taskID, rec.Path),
@@ -478,16 +709,24 @@ func persistRoleRun(ctx context.Context, db *state.DB, taskID string, role model
 			return err
 		}
 	}
-	payload, err := json.Marshal(map[string]any{
-		"role":     role.String(),
-		"status":   run.Parsed.Result,
-		"attempts": run.Attempts,
-	})
-	if err != nil {
-		return err
+	for _, normalization := range run.Parsed.Normalizations {
+		payload, err := json.Marshal(map[string]any{
+			"role": role.String(), "code": normalization.Code,
+			"message": normalization.Message, "line": normalization.Line,
+			"attempts": run.Attempts,
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := db.InsertEvent(ctx, state.Event{
+			TaskID:  taskID,
+			Type:    "role.protocol_normalized",
+			Payload: string(payload),
+		}); err != nil {
+			return err
+		}
 	}
-	_, err = db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "role.completed", Payload: string(payload)})
-	return err
+	return nil
 }
 
 func nextUsageOrdinal(ctx context.Context, db *state.DB, taskID, role string) (int, error) {
@@ -499,7 +738,10 @@ WHERE task_id = ? AND role = ?`, taskID, role).Scan(&count)
 	return count, err
 }
 
-func persistRawRoleStream(store artifact.Store, role model.Role, raw string, failed bool) error {
+func persistRawRoleStream(ctx context.Context, store artifact.Store, role model.Role, raw string, failed bool) error {
+	if err := CheckExecution(ctx); err != nil {
+		return err
+	}
 	suffix := ".stream"
 	if failed {
 		suffix = "-failed.stream"
@@ -514,12 +756,10 @@ func persistRawRoleStream(store artifact.Store, role model.Role, raw string, fai
 	return err
 }
 
-func nextRoleCount(counts map[model.Role]int, role model.Role) int {
-	counts[role]++
-	return counts[role]
-}
-
-func snapshotRoleAttempt(root, taskID string, run RoleRun, ordinal int) error {
+func snapshotRoleAttempt(ctx context.Context, root, taskID string, run RoleRun, ordinal int) error {
+	if err := CheckExecution(ctx); err != nil {
+		return err
+	}
 	if ordinal <= 0 {
 		return nil
 	}
@@ -649,7 +889,10 @@ func sourceEditRepairLimit(opts RunnerOptions) int {
 	return opts.MaxSourceEditRepairs
 }
 
-func appendRoleReportProvenance(store artifact.Store, run model.RunResult, provider model.Provider, modelID string, packet model.Packet) error {
+func appendRoleReportProvenance(ctx context.Context, store artifact.Store, run model.RunResult, provider model.Provider, modelID string, packet model.Packet) error {
+	if err := CheckExecution(ctx); err != nil {
+		return err
+	}
 	if run.Parsed == nil || run.Parsed.Result == nil {
 		return nil
 	}
@@ -693,12 +936,23 @@ func appendRoleReportProvenance(store artifact.Store, run model.RunResult, provi
 
 const maxCommandContinuationPreviewBytes = 12000
 
-func commandContinuationHandler(db *state.DB, layout workbench.Layout, taskID string, worktrees []WorktreeStatus, store artifact.Store) model.CommandHandler {
+func commandContinuationHandler(db *state.DB, layout workbench.Layout, taskID string, role model.Role, worktrees []WorktreeStatus, store artifact.Store) model.CommandHandler {
 	return func(ctx context.Context, commands []stream.CommandProposal) (string, error) {
 		var b strings.Builder
 		for i, proposal := range commands {
-			result, err := executeProposal(ctx, db, layout, taskID, worktrees, proposal)
+			result, err := executeProposal(ctx, db, layout, taskID, role, worktrees, proposal)
 			if err != nil {
+				var denied policy.CommandDeniedError
+				if errors.As(err, &denied) {
+					if i > 0 {
+						b.WriteByte('\n')
+					}
+					if recordErr := recordCommandRejected(ctx, db, taskID, role, proposal, denied.Reason); recordErr != nil {
+						return "", recordErr
+					}
+					fmt.Fprintf(&b, "command repo:%s rejected:true reason:%s\n", proposal.Repo, singleLine(denied.Reason))
+					continue
+				}
 				return "", err
 			}
 			if i > 0 {
@@ -708,6 +962,24 @@ func commandContinuationHandler(db *state.DB, layout workbench.Layout, taskID st
 		}
 		return b.String(), nil
 	}
+}
+
+func recordCommandRejected(ctx context.Context, db *state.DB, taskID string, role model.Role, proposal stream.CommandProposal, reason string) error {
+	payload, err := json.Marshal(map[string]string{
+		"role":    role.String(),
+		"repo_id": proposal.Repo,
+		"command": proposal.Command,
+		"reason":  reason,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "command.rejected", Payload: string(payload)})
+	return err
+}
+
+func singleLine(value string) string {
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func appendCommandContinuationResult(b *strings.Builder, store artifact.Store, result command.Result) {
@@ -757,19 +1029,44 @@ func commandPreview(store artifact.Store, path string) string {
 	return text
 }
 
-func executeProposal(ctx context.Context, db *state.DB, layout workbench.Layout, taskID string, worktrees []WorktreeStatus, proposal stream.CommandProposal) (command.Result, error) {
+func executeProposal(ctx context.Context, db *state.DB, layout workbench.Layout, taskID string, role model.Role, worktrees []WorktreeStatus, proposal stream.CommandProposal) (command.Result, error) {
 	wt, err := worktreeForRepo(worktrees, proposal.Repo)
 	if err != nil {
 		return command.Result{}, err
 	}
 	artifactDir := filepath.Join(layout.Artifacts, taskID)
-	executor := command.NewExecutor(policy.DefaultCommandPolicy(wt.Path, artifactDir))
+	commandRoot := wt.Path
+	commandPolicy := policy.DefaultCommandPolicy(wt.Path, artifactDir)
+	cleanup := func() {}
+	if role == model.RoleReviewer {
+		commandPolicy = policy.ReadOnlyCommandPolicy(wt.Path, artifactDir)
+		if err := commandPolicy.ValidateCommand(proposal.Command); err != nil {
+			return command.Result{}, err
+		}
+		snapshotParent, err := os.MkdirTemp("", "midgard-review-")
+		if err != nil {
+			return command.Result{}, err
+		}
+		commandRoot = filepath.Join(snapshotParent, "worktree")
+		if err := gitrepo.AddSnapshotWorktree(ctx, wt.Path, commandRoot); err != nil {
+			_ = os.RemoveAll(snapshotParent)
+			return command.Result{}, err
+		}
+		cleanup = func() {
+			_ = gitrepo.RemoveSnapshotWorktree(context.WithoutCancel(ctx), wt.Path, commandRoot)
+			_ = os.RemoveAll(snapshotParent)
+		}
+		commandPolicy = policy.ReadOnlyCommandPolicy(commandRoot, artifactDir)
+	}
+	defer cleanup()
+	executor := command.NewExecutor(commandPolicy)
 	result, err := executor.Run(ctx, command.Request{
 		TaskID:      taskID,
 		RepoID:      wt.RepoID,
 		Command:     proposal.Command,
-		CWD:         wt.Path,
+		CWD:         commandRoot,
 		ArtifactDir: artifactDir,
+		Fence:       CheckExecution,
 	})
 	if err != nil {
 		return command.Result{}, err
@@ -787,6 +1084,9 @@ func executeProposal(ctx context.Context, db *state.DB, layout workbench.Layout,
 }
 
 func writePatch(ctx context.Context, root, taskID string, worktrees []WorktreeStatus) (string, bool, error) {
+	if err := CheckExecution(ctx); err != nil {
+		return "", false, err
+	}
 	status, err := workbench.Status(root)
 	if err != nil {
 		return "", false, err
@@ -810,6 +1110,9 @@ func writePatch(ctx context.Context, root, taskID string, worktrees []WorktreeSt
 		patch.WriteString(diff)
 	}
 	store := artifact.NewStore(filepath.Join(layout.Artifacts, taskID))
+	if err := CheckExecution(ctx); err != nil {
+		return "", false, err
+	}
 	rec, err := store.Put(artifact.Record{Path: "patch.diff", Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "patch"}, []byte(patch.String()))
 	if err != nil {
 		return "", false, err
@@ -869,13 +1172,13 @@ func worktreeForRepo(worktrees []WorktreeStatus, repoID string) (WorktreeStatus,
 	return WorktreeStatus{}, fmt.Errorf("repo %q not found for task", repoID)
 }
 
-func finalState(runs []RoleRun, patchHasContent bool) string {
-	if len(runs) == 0 {
+func finalState(history roleHistory, patchHasContent bool) string {
+	if !history.HasLatest {
 		return "open"
 	}
-	last := runs[len(runs)-1]
+	last := history.Latest
 	if last.Role == model.RoleReviewer && last.Status == string(review.VerdictApproved) {
-		if implementerStatus(runs) == "no-op" || patchHasContent {
+		if (history.HasLatestImplementer && history.LatestImplementer.Status == "no-op") || patchHasContent {
 			return "completed"
 		}
 		return "blocked"
@@ -889,25 +1192,41 @@ func finalState(runs []RoleRun, patchHasContent bool) string {
 	return "blocked"
 }
 
-func implementerStatus(runs []RoleRun) string {
-	for _, run := range runs {
-		if run.Role == model.RoleImplementer {
-			return run.Status
+func taskCostSummary(ctx context.Context, root, taskID string) (float64, []string, error) {
+	status, err := workbench.Status(root)
+	if err != nil {
+		return 0, nil, err
+	}
+	db, err := state.Open(ctx, workbench.NewLayout(status.Root).State)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer db.Close()
+	rollups, err := db.CostRollupsForTask(ctx, taskID)
+	if err != nil {
+		return 0, nil, err
+	}
+	var amount float64
+	var caveats []string
+	seenCaveats := map[string]bool{}
+	for _, rollup := range rollups {
+		value, err := strconv.ParseFloat(rollup.AmountUSD, 64)
+		if err != nil {
+			return 0, nil, fmt.Errorf("parse cost rollup %s: %w", rollup.ID, err)
+		}
+		amount += value
+		if rollup.Caveats != "" && !seenCaveats[rollup.Caveats] {
+			seenCaveats[rollup.Caveats] = true
+			caveats = append(caveats, rollup.Caveats)
 		}
 	}
-	return ""
-}
-
-func sumCost(runs []RoleRun, pricing cost.Pricing) float64 {
-	var amount float64
-	for _, run := range runs {
-		amount += (float64(run.InputTokens)/1_000_000)*pricing.InputUSDPerMillion +
-			(float64(run.OutputTokens)/1_000_000)*pricing.OutputUSDPerMillion
-	}
-	return amount
+	return amount, caveats, nil
 }
 
 func appendTaskRunSummary(ctx context.Context, root, taskID string, loop LoopResult) error {
+	if err := CheckExecution(ctx); err != nil {
+		return err
+	}
 	status, err := workbench.Status(root)
 	if err != nil {
 		return err
@@ -921,10 +1240,16 @@ func appendTaskRunSummary(ctx context.Context, root, taskID string, loop LoopRes
 	b.WriteString("- patch: artifact:")
 	b.WriteString(loop.PatchPath)
 	b.WriteString("\n")
-	b.WriteString("- cost: $")
-	b.WriteString(strconv.FormatFloat(loop.CostUSD, 'f', 6, 64))
+	appendCostSummaryLine(&b, loop.CostUSD, loop.CostCaveats)
 	b.WriteString("\n")
-	for _, run := range loop.RoleRuns {
+	if loop.Error != "" {
+		fmt.Fprintf(&b, "- run_error: %s\n\n", strings.ReplaceAll(loop.Error, "\n", " "))
+	}
+	roleRuns, err := taskRoleRunSummary(ctx, status.Root, taskID)
+	if err != nil {
+		return err
+	}
+	for _, run := range roleRuns {
 		fmt.Fprintf(
 			&b,
 			"- role: %s status:%s artifact:%s provider:%s model:%s provider_fingerprint:%s usage:in=%d,out=%d\n",
@@ -946,13 +1271,72 @@ func appendTaskRunSummary(ctx context.Context, root, taskID string, loop LoopRes
 		b.WriteString("\n## Source Edit Summary\n\n")
 		b.WriteString(sourceEditSummary)
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
+	if err := CheckExecution(ctx); err != nil {
 		return err
 	}
-	defer file.Close()
-	_, err = file.WriteString(b.String())
-	return err
+	return replaceTaskReportSummary(path, b.String())
+}
+
+func taskRoleRunSummary(ctx context.Context, root, taskID string) ([]RoleRun, error) {
+	db, err := state.Open(ctx, filepath.Join(root, ".midgard", "state.sqlite"))
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	events, err := db.EventsForTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	latest := map[model.Role]roleStatus{}
+	for _, event := range events {
+		if event.Type != "role.completed" {
+			continue
+		}
+		completed, ok := parseRoleCompletedEvent(event.Payload)
+		if ok {
+			latest[completed.Role] = completed
+		}
+	}
+	usage, err := db.UsageRecordsForTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	byRole := map[model.Role]*RoleRun{}
+	for _, record := range usage {
+		role := model.Role(record.Role)
+		run := byRole[role]
+		if run == nil {
+			run = &RoleRun{Role: role}
+			byRole[role] = run
+		}
+		run.ProviderID = record.ProviderID
+		run.ModelID = record.ModelID
+		run.ProviderFingerprint = model.ProviderFingerprint(roleProviderIdentity(record.ProviderID), record.ModelID)
+		run.InputTokens += record.InputTokens
+		run.OutputTokens += record.OutputTokens
+	}
+	orderedRoles := []model.Role{model.RolePlanner, model.RoleImplementer, model.RoleReviewer, model.RoleCompactor}
+	runs := make([]RoleRun, 0, len(latest))
+	for _, role := range orderedRoles {
+		completed, ok := latest[role]
+		if !ok {
+			continue
+		}
+		run := byRole[role]
+		if run == nil {
+			run = &RoleRun{Role: role}
+		}
+		run.Status = completed.Status
+		run.Artifact = completed.Artifact
+		runs = append(runs, *run)
+	}
+	return runs, nil
+}
+
+type roleProviderIdentity string
+
+func (p roleProviderIdentity) ID() string {
+	return string(p)
 }
 
 func sourceEditTaskSummary(ctx context.Context, root, taskID string) (string, error) {
@@ -965,7 +1349,8 @@ func sourceEditTaskSummary(ctx context.Context, root, taskID string) (string, er
 	if err != nil {
 		return "", err
 	}
-	var b strings.Builder
+	summaries := map[string]*sourceEditFileEventSummary{}
+	var appliedTotal, failedTotal, partialTotal, normalizedTotal, repairTotal int
 	for _, event := range events {
 		switch event.Type {
 		case "source_edit.apply_failed":
@@ -973,42 +1358,151 @@ func sourceEditTaskSummary(ctx context.Context, root, taskID string) (string, er
 			if err := json.Unmarshal([]byte(event.Payload), &failed); err != nil {
 				continue
 			}
-			fmt.Fprintf(
-				&b,
-				"- apply_failed attempt:%d file:%s partial_applied:%t patch:%s stderr:%s context:%s remaining_repairs:%d\n",
-				failed.Attempt,
-				failed.File,
-				failed.PartialApplied,
-				artifactRef(failed.FailedPatchArtifact),
-				artifactRef(failed.StderrArtifact),
-				artifactRef(failed.SourceContextArtifact),
-				failed.RemainingRepairs,
-			)
-		case "source_edit.repair_requested":
-			var repair struct {
-				Attempt          int `json:"attempt"`
-				NextApplyAttempt int `json:"next_apply_attempt"`
+			summary := sourceEditFileSummary(summaries, failed.File)
+			summary.failed++
+			summary.lastFailure = failed
+			summary.hasFailure = true
+			summary.lastFailureID = event.ID
+			failedTotal++
+			if failed.PartialApplied {
+				summary.partial++
+				partialTotal++
 			}
-			if err := json.Unmarshal([]byte(event.Payload), &repair); err != nil {
+		case "source_edit.repair_requested":
+			repairTotal++
+		case "source_edit.normalized":
+			var normalized sourceEditNormalizedEvent
+			if err := json.Unmarshal([]byte(event.Payload), &normalized); err != nil {
 				continue
 			}
-			fmt.Fprintf(&b, "- repair_requested after_attempt:%d next_attempt:%d\n", repair.Attempt, repair.NextApplyAttempt)
+			summary := sourceEditFileSummary(summaries, normalized.File)
+			summary.normalized++
+			normalizedTotal++
 		case "source_edit.applied":
 			var applied sourceEditAppliedEvent
 			if err := json.Unmarshal([]byte(event.Payload), &applied); err != nil {
 				continue
 			}
-			fmt.Fprintf(
-				&b,
-				"- applied file:%s action:%s mode:%s content:%s\n",
-				applied.File,
-				applied.Action,
-				applied.Mode,
-				applied.Content,
-			)
+			summary := sourceEditFileSummary(summaries, applied.File)
+			summary.applied++
+			summary.lastContent = applied.Content
+			summary.lastAppliedID = event.ID
+			appliedTotal++
 		}
 	}
+	if appliedTotal == 0 && failedTotal == 0 && repairTotal == 0 {
+		return "", nil
+	}
+	files := make([]string, 0, len(summaries))
+	for file := range summaries {
+		files = append(files, file)
+	}
+	sort.Strings(files)
+	var b strings.Builder
+	fmt.Fprintf(
+		&b,
+		"- totals: applied:%d failed_apply:%d partial_apply:%d normalized:%d repair_requests:%d files:%d\n",
+		appliedTotal,
+		failedTotal,
+		partialTotal,
+		normalizedTotal,
+		repairTotal,
+		len(files),
+	)
+	if appliedTotal > 0 {
+		b.WriteString("- outcome: source edits survived in the worktree; see patch artifact for final diff\n")
+	} else if failedTotal > 0 {
+		b.WriteString("- outcome: no source edits applied; inspect failed patch diagnostics\n")
+	}
+	b.WriteString("- files:\n")
+	for _, file := range files {
+		summary := summaries[file]
+		fmt.Fprintf(
+			&b,
+			"  - file:%s applied:%d failed_apply:%d partial_apply:%d normalized:%d",
+			file,
+			summary.applied,
+			summary.failed,
+			summary.partial,
+			summary.normalized,
+		)
+		if summary.lastContent != "" {
+			fmt.Fprintf(&b, " last_applied:%s", summary.lastContent)
+		}
+		if summary.hasFailure {
+			failed := summary.lastFailure
+			fmt.Fprintf(
+				&b,
+				" last_failure_attempt:%d partial_applied:%t remaining_repairs:%d refs:patch:%s stderr:%s context:%s",
+				failed.Attempt,
+				failed.PartialApplied,
+				failed.RemainingRepairs,
+				artifactRef(failed.FailedPatchArtifact),
+				artifactRef(failed.StderrArtifact),
+				artifactRef(failed.SourceContextArtifact),
+			)
+		}
+		if summary.hasFailure && summary.lastFailureID > summary.lastAppliedID {
+			b.WriteString(" unresolved:true")
+		}
+		b.WriteByte('\n')
+	}
 	return b.String(), nil
+}
+
+type sourceEditFileEventSummary struct {
+	applied       int
+	failed        int
+	partial       int
+	normalized    int
+	lastContent   string
+	lastFailure   sourceEditApplyFailedEvent
+	hasFailure    bool
+	lastAppliedID int64
+	lastFailureID int64
+}
+
+func sourceEditFileSummary(summaries map[string]*sourceEditFileEventSummary, file string) *sourceEditFileEventSummary {
+	if file == "" {
+		file = "(unknown)"
+	}
+	summary := summaries[file]
+	if summary == nil {
+		summary = &sourceEditFileEventSummary{}
+		summaries[file] = summary
+	}
+	return summary
+}
+
+func appendCostSummaryLine(b *strings.Builder, amount float64, caveats []string) {
+	if len(caveats) > 0 {
+		b.WriteString("- cost: unknown")
+		b.WriteString(" (")
+		b.WriteString(strings.Join(caveats, "; "))
+		b.WriteString(")")
+		return
+	}
+	b.WriteString("- cost: $")
+	b.WriteString(strconv.FormatFloat(amount, 'f', 6, 64))
+}
+
+func replaceTaskReportSummary(path, summary string) error {
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	base := strings.TrimRight(string(data), "\n")
+	cut := len(base)
+	for _, marker := range []string{"\n\n## Midgard Run Summary", "\n\n## Source Edit Summary"} {
+		if idx := strings.Index(base, marker); idx >= 0 && idx < cut {
+			cut = idx
+		}
+	}
+	base = strings.TrimRight(base[:cut], "\n")
+	if base != "" {
+		base += "\n\n"
+	}
+	return os.WriteFile(path, []byte(base+strings.TrimLeft(summary, "\n")), 0o644)
 }
 
 func artifactID(taskID, path string) string {

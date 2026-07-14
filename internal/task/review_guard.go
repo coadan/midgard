@@ -45,7 +45,7 @@ func applyReviewGuards(ctx context.Context, root, taskID string, run RoleRun) (R
 	if ok {
 		return run, nil
 	}
-	if err := appendAutoReviewFinding(root, taskID, replacement, reason); err != nil {
+	if err := appendAutoReviewFinding(ctx, root, taskID, replacement, reason); err != nil {
 		return run, err
 	}
 	if err := recordAutoReviewEvent(ctx, root, taskID, replacement, reason); err != nil {
@@ -109,7 +109,10 @@ func replacementSatisfied(worktrees []WorktreeStatus, replacement phraseReplacem
 	}
 }
 
-func appendAutoReviewFinding(root, taskID string, replacement phraseReplacement, reason string) error {
+func appendAutoReviewFinding(ctx context.Context, root, taskID string, replacement phraseReplacement, reason string) error {
+	if err := CheckExecution(ctx); err != nil {
+		return err
+	}
 	status, err := workbench.Status(root)
 	if err != nil {
 		return err

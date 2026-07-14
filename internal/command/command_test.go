@@ -2,6 +2,7 @@ package command
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +14,34 @@ import (
 	"midgard/internal/gitrepo"
 	"midgard/internal/policy"
 )
+
+func TestExecutorFenceStopsArtifactPersistence(t *testing.T) {
+	ctx := context.Background()
+	repo := initCommandRepo(t)
+	artifactDir := filepath.Join(t.TempDir(), "artifacts")
+	fenceLost := errors.New("fence lost")
+	checks := 0
+	_, err := NewExecutor(policy.DefaultCommandPolicy(repo, artifactDir)).Run(ctx, Request{
+		ID: "cmd_fenced", Command: "printf stale", CWD: repo, ArtifactDir: artifactDir,
+		Fence: func(context.Context) error {
+			checks++
+			if checks > 1 {
+				return fenceLost
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, fenceLost) {
+		t.Fatalf("executor error = %v, want fence loss", err)
+	}
+	entries, readErr := os.ReadDir(artifactDir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("stale command artifacts = %#v", entries)
+	}
+}
 
 func TestExecutorRunsAllowedCommandAndWritesArtifacts(t *testing.T) {
 	ctx := context.Background()

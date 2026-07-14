@@ -10,7 +10,7 @@ type CostRollup struct {
 }
 
 func (db *DB) InsertCostRollup(ctx context.Context, rollup CostRollup) error {
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := db.fencedExecContext(ctx, `
 INSERT INTO cost_rollups (id, task_id, amount_usd, caveats)
 VALUES (?, ?, ?, ?)`,
 		rollup.ID,

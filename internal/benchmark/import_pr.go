@@ -14,8 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"midgard/internal/gitrepo"
 )
 
 const defaultGitHubAPIBaseURL = "https://api.github.com"
@@ -30,6 +28,7 @@ type ImportPROptions struct {
 	Token         string
 	HTTPClient    *http.Client
 	WorkDir       string
+	Checks        []AcceptanceCheck
 }
 
 type ImportPRResult struct {
@@ -99,11 +98,15 @@ func ImportPR(ctx context.Context, opts ImportPROptions) (ImportPRResult, error)
 		return ImportPRResult{}, err
 	}
 	cloneURL := firstNonEmpty(opts.CloneURL, pr.Base.Repo.CloneURL, githubHTTPSURL(repo))
+	referencePatch, err := fetchGitHubPullDiff(ctx, client, apiBase, opts.Token, repo, opts.PullNumber)
+	if err != nil {
+		return ImportPRResult{}, err
+	}
 	referencePath := opts.ReferencePath
 	if referencePath == "" {
 		referencePath = filepath.Join(filepath.Dir(opts.OutPath), "references", fmt.Sprintf("%s-pr-%d.patch", repoFileSlug(repo.Slug), opts.PullNumber))
 	}
-	if err := writeReferencePatch(ctx, cloneURL, pr.Base.SHA, pr.MergeCommitSHA, referencePath, opts.WorkDir); err != nil {
+	if err := writeReferencePatch(referencePath, referencePatch); err != nil {
 		return ImportPRResult{}, err
 	}
 
@@ -119,9 +122,10 @@ func ImportPR(ctx context.Context, opts ImportPROptions) (ImportPRResult, error)
 		Items: []Item{{
 			ID:                   fmt.Sprintf("pr-%d", opts.PullNumber),
 			Title:                pr.Title,
-			Objective:            importPRObjective(repo.Slug, opts.PullNumber, pr.Title, pr.Body, files),
+			Objective:            importPRObjective(pr.Title, pr.Body, files),
 			TaskID:               benchmarkTaskID(manifestID, fmt.Sprintf("pr-%d", opts.PullNumber)),
 			RepoIDs:              []string{"repo1"},
+			AcceptanceChecks:     append([]AcceptanceCheck(nil), opts.Checks...),
 			ExpectedTouchedFiles: files,
 			HiddenReferencePatch: filepath.ToSlash(referenceRef),
 			HiddenReferencePRs: []ReferencePR{{
@@ -175,6 +179,36 @@ func fetchGitHubPullFiles(ctx context.Context, client *http.Client, apiBase, tok
 	return files, nil
 }
 
+func fetchGitHubPullDiff(ctx context.Context, client *http.Client, apiBase, token string, repo githubRepoRef, number int) ([]byte, error) {
+	path := fmt.Sprintf("/repos/%s/pulls/%d", repo.Slug, number)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github.diff")
+	req.Header.Set("User-Agent", "midgard")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("github diff api status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	diff, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(string(diff)) == "" {
+		return nil, fmt.Errorf("github PR %s#%d returned an empty diff", repo.Slug, number)
+	}
+	return diff, nil
+}
+
 func getGitHubJSON(ctx context.Context, client *http.Client, apiBase, token, path string, target any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+path, nil)
 	if err != nil {
@@ -197,55 +231,14 @@ func getGitHubJSON(ctx context.Context, client *http.Client, apiBase, token, pat
 	return json.NewDecoder(resp.Body).Decode(target)
 }
 
-func writeReferencePatch(ctx context.Context, cloneURL, baseSHA, mergedSHA, referencePath, workDir string) error {
-	if cloneURL == "" {
-		return fmt.Errorf("clone url is required")
-	}
-	cleanup := func() {}
-	if workDir == "" {
-		tmp, err := os.MkdirTemp("", "midgard-import-pr-*")
-		if err != nil {
-			return err
-		}
-		workDir = tmp
-		cleanup = func() { _ = os.RemoveAll(tmp) }
-	}
-	defer cleanup()
-	clonePath := filepath.Join(workDir, "repo")
-	if err := os.RemoveAll(clonePath); err != nil {
-		return err
-	}
-	if err := gitrepo.Clone(ctx, cloneURL, clonePath); err != nil {
-		return err
-	}
-	if err := ensureCommit(ctx, clonePath, baseSHA); err != nil {
-		return fmt.Errorf("base commit %s: %w", baseSHA, err)
-	}
-	if err := ensureCommit(ctx, clonePath, mergedSHA); err != nil {
-		return fmt.Errorf("merged commit %s: %w", mergedSHA, err)
-	}
-	patch, err := gitrepo.Run(ctx, clonePath, "diff", "--binary", baseSHA+".."+mergedSHA)
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(patch) == "" {
-		return fmt.Errorf("reference patch is empty for %s..%s", baseSHA, mergedSHA)
-	}
+func writeReferencePatch(referencePath string, patch []byte) error {
 	if err := os.MkdirAll(filepath.Dir(referencePath), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(referencePath, []byte(patch+"\n"), 0o644)
-}
-
-func ensureCommit(ctx context.Context, repoPath, sha string) error {
-	if _, err := gitrepo.Run(ctx, repoPath, "cat-file", "-e", sha+"^{commit}"); err == nil {
-		return nil
+	if len(patch) == 0 || patch[len(patch)-1] != '\n' {
+		patch = append(patch, '\n')
 	}
-	if _, err := gitrepo.Run(ctx, repoPath, "fetch", "origin", sha); err != nil {
-		return err
-	}
-	_, err := gitrepo.Run(ctx, repoPath, "cat-file", "-e", sha+"^{commit}")
-	return err
+	return os.WriteFile(referencePath, patch, 0o644)
 }
 
 func writeManifest(path string, manifest Manifest) error {
@@ -277,9 +270,9 @@ func looksLocalRepoSource(source string) bool {
 	return err != nil || parsed.Scheme == ""
 }
 
-func importPRObjective(repo string, number int, title, body string, files []string) string {
+func importPRObjective(title, body string, files []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Recreate the source changes from merged GitHub PR %s#%d: %s.", repo, number, strings.TrimSpace(title))
+	fmt.Fprintf(&b, "Implement this task: %s.", strings.TrimSpace(title))
 	if len(files) > 0 {
 		b.WriteString(" Keep source changes scoped to these touched files when possible: ")
 		b.WriteString(strings.Join(files, ", "))

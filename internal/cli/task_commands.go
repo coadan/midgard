@@ -83,6 +83,15 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			fmt.Fprintf(stdout, "worktree: %s\n", wt.Path)
 			fmt.Fprintf(stdout, "dirty: %t\n", wt.Dirty)
 		}
+		if status.ForgeGates {
+			if status.ForgeReady {
+				fmt.Fprintln(stdout, "forge_readiness: ready")
+			} else {
+				fmt.Fprintf(stdout, "forge_readiness: blocked %s\n", strings.Join(status.ForgeBlockers, ","))
+			}
+		} else if len(status.ForgeWarnings) > 0 {
+			fmt.Fprintf(stdout, "forge_readiness: disabled warnings:%s\n", strings.Join(status.ForgeWarnings, ","))
+		}
 		fmt.Fprintf(stdout, "next: %s\n", status.NextAction)
 		return nil
 	case "diff":
@@ -183,6 +192,8 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stdout, "task: %s\n", *id)
 		fmt.Fprintf(stdout, "feedback: %s\n", *status)
 		return nil
+	case "pr":
+		return runTaskPR(ctx, args[1:], stdout, stderr)
 	case "step":
 		fs := flag.NewFlagSet("midgard task step", flag.ContinueOnError)
 		fs.SetOutput(stderr)
@@ -279,7 +290,7 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stdout, "task: %s\n", result.TaskID)
 		fmt.Fprintf(stdout, "state: %s\n", result.State)
 		fmt.Fprintf(stdout, "patch: %s\n", result.PatchPath)
-		fmt.Fprintf(stdout, "cost: $%.6f\n", result.CostUSD)
+		printRunCost(stdout, result.CostUSD, result.CostCaveats)
 		for _, run := range result.RoleRuns {
 			fmt.Fprintf(stdout, "role: %s status:%s artifact:%s attempts:%d usage:in=%d,out=%d\n", run.Role, run.Status, run.Artifact, run.Attempts, run.InputTokens, run.OutputTokens)
 		}
@@ -325,6 +336,7 @@ func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "  status  show task state")
 	fmt.Fprintln(w, "  diff    show task diff")
 	fmt.Fprintln(w, "  stream  stream task events")
+	fmt.Fprintln(w, "  pr      link and inspect task pull requests")
 	fmt.Fprintln(w, "  step    advance one role")
 	fmt.Fprintln(w, "  run     run planner, implementer, and reviewer")
 	fmt.Fprintln(w, "  cleanup remove task runtime files")
@@ -390,10 +402,7 @@ func roleProviderWithOptions(providerName, fakeStream string, opts providerOptio
 			return nil, fmt.Errorf("DEEPSEEK_API_KEY is required")
 		}
 		client := deepseek.New(key)
-		client.ReasoningEffort = strings.TrimSpace(opts.DeepSeekReasoningEffort)
-		if client.ReasoningEffort == "" {
-			client.ReasoningEffort = strings.TrimSpace(os.Getenv(deepseek.ReasoningEffortEnvName))
-		}
+		client.ReasoningEffort = resolvedDeepSeekReasoningEffort(opts.DeepSeekReasoningEffort)
 		return client, nil
 	case "codex":
 		provider, err := codexprovider.NewFromLocalAuth()
@@ -407,6 +416,13 @@ func roleProviderWithOptions(providerName, fakeStream string, opts providerOptio
 	default:
 		return nil, fmt.Errorf("unknown provider %q", providerName)
 	}
+}
+
+func resolvedDeepSeekReasoningEffort(value string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(deepseek.ReasoningEffortEnvName))
 }
 
 func loopProviders(providerName string, fakeStreams map[model.Role]string) (midgardtask.RoleProviders, error) {
@@ -472,8 +488,30 @@ func pricingForProvider(providerName, modelID string) cost.Pricing {
 				Source:              "https://api-docs.deepseek.com/quick_start/pricing",
 			}
 		}
+	case "fake":
+		return cost.Pricing{
+			ID:         "fake-zero",
+			ProviderID: "fake",
+			ModelID:    modelID,
+			Currency:   "USD",
+			Source:     "synthetic test provider",
+		}
 	}
-	return cost.Pricing{ID: "manual", MissingPricingCaveat: "pricing not configured"}
+	return cost.Pricing{
+		ID:                   "manual",
+		ProviderID:           providerName,
+		ModelID:              modelID,
+		Currency:             "USD",
+		MissingPricingCaveat: "pricing not configured; usage is recorded but cost is unknown",
+	}
+}
+
+func printRunCost(w io.Writer, amount float64, caveats []string) {
+	if len(caveats) > 0 {
+		fmt.Fprintf(w, "cost: unknown (%s)\n", strings.Join(caveats, "; "))
+		return
+	}
+	fmt.Fprintf(w, "cost: $%.6f\n", amount)
 }
 
 func streamBudget(maxOutputTokens int) stream.Budget {

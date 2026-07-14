@@ -2,10 +2,16 @@ package task
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"midgard/internal/cost"
 	"midgard/internal/model"
@@ -14,6 +20,89 @@ import (
 	"midgard/internal/stream"
 	"midgard/internal/workbench"
 )
+
+type blockingProvider struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	calls   atomic.Int64
+	text    string
+}
+
+func (p *blockingProvider) ID() string { return "blocking" }
+
+func (p *blockingProvider) Stream(ctx context.Context, _ model.Packet, emit func(model.Delta) error) (model.Usage, error) {
+	p.calls.Add(1)
+	p.once.Do(func() { close(p.entered) })
+	select {
+	case <-ctx.Done():
+		return model.Usage{}, context.Cause(ctx)
+	case <-p.release:
+	}
+	if err := emit(model.Delta{Text: p.text}); err != nil {
+		return model.Usage{}, err
+	}
+	return model.Usage{InputTokens: 10, OutputTokens: 5}, nil
+}
+
+func TestRunLoopRejectsConcurrentTaskExecutionBeforeProviderCall(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "loop-contention-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_contended", Objective: "exercise execution ownership"}); err != nil {
+		t.Fatal(err)
+	}
+
+	planner := &blockingProvider{
+		entered: make(chan struct{}), release: make(chan struct{}),
+		text: "@report plan.mdx\n# Plan\n\nReady.\n@result status:ready artifact:plan.mdx checks:none\n",
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := RunLoop(ctx, root, "task_contended", RunnerOptions{
+			ModelID: "fake-model",
+			Providers: RoleProviders{
+				model.RolePlanner:     planner,
+				model.RoleImplementer: fake.New(fake.Response{Text: "@report implementation.mdx\n# Implementation\n\nNo changes.\n@result status:no-op artifact:implementation.mdx checks:none\n"}),
+				model.RoleReviewer:    fake.New(fake.Response{Text: "@report review.mdx\n# Review\n\nApproved.\n@result status:approved artifact:review.mdx findings:none\n"}),
+			},
+		})
+		firstDone <- err
+	}()
+	select {
+	case <-planner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first task execution did not reach provider")
+	}
+
+	secondPlanner := fake.New(fake.Response{Text: planner.text})
+	_, err := RunLoop(ctx, root, "task_contended", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RolePlanner: secondPlanner, model.RoleImplementer: fake.New(), model.RoleReviewer: fake.New(),
+		},
+	})
+	var heldErr state.ExecutionLeaseHeldError
+	if !errors.As(err, &heldErr) {
+		t.Fatalf("concurrent run error = %v, want lease held", err)
+	}
+	if secondPlanner.Calls() != 0 {
+		t.Fatalf("second planner calls = %d, want 0", secondPlanner.Calls())
+	}
+	close(planner.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if planner.calls.Load() != 1 {
+		t.Fatalf("first planner calls = %d, want 1", planner.calls.Load())
+	}
+}
 
 func TestRunLoopFakeProviderCompletesTask(t *testing.T) {
 	ctx := context.Background()
@@ -104,6 +193,9 @@ func TestRunLoopFakeProviderCompletesTask(t *testing.T) {
 	if status.Task.State != "completed" {
 		t.Fatalf("db task state = %s", status.Task.State)
 	}
+	if status.NextAction != "done" {
+		t.Fatalf("next action = %s, want done", status.NextAction)
+	}
 	taskReport, err := os.ReadFile(filepath.Join(root, ".midgard", "tasks", "task_e2e.mdx"))
 	if err != nil {
 		t.Fatal(err)
@@ -142,6 +234,265 @@ func TestRunLoopFakeProviderCompletesTask(t *testing.T) {
 	}
 	if !sawCommand || !sawRole {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestRunLoopResumesFromAcceptedPlannerCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "planner-checkpoint-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_planner_checkpoint", Objective: "inspect README without changes"}); err != nil {
+		t.Fatal(err)
+	}
+	pricing := cost.Pricing{InputUSDPerMillion: 1, OutputUSDPerMillion: 1}
+	if _, err := RunRole(ctx, root, "task_planner_checkpoint", model.RolePlanner, RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RolePlanner: fake.New(fake.Response{
+				Text:  "@report plan.mdx\n# Plan\n\nInspect README.\n@result status:ready checks:none\n",
+				Usage: model.Usage{InputTokens: 10, OutputTokens: 10},
+			}),
+		},
+		Pricing: pricing,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".midgard", "artifacts", "task_planner_checkpoint", "attempts", "planner", "1", "plan.mdx")); err != nil {
+		t.Fatalf("accepted planner checkpoint snapshot: %v", err)
+	}
+
+	result, err := RunLoop(ctx, root, "task_planner_checkpoint", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RoleImplementer: fake.New(fake.Response{
+				Text:  "@report implementation.mdx\n# Implementation\n\nNo source change is needed.\n@result status:no-op artifact:implementation.mdx checks:none\n",
+				Usage: model.Usage{InputTokens: 20, OutputTokens: 20},
+			}),
+			model.RoleReviewer: fake.New(fake.Response{
+				Text:  "@report review.mdx\n# Review\n\nNo P0/P1 findings.\n@result status:approved artifact:review.mdx findings:none\n",
+				Usage: model.Usage{InputTokens: 30, OutputTokens: 30},
+			}),
+		},
+		Pricing: pricing,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "completed" || len(result.RoleRuns) != 2 || result.RoleRuns[0].Role != model.RoleImplementer {
+		t.Fatalf("resumed result = %#v", result)
+	}
+	if math.Abs(result.CostUSD-0.000120) > 1e-12 {
+		t.Fatalf("cumulative cost = %.6f, want 0.000120", result.CostUSD)
+	}
+	taskReport, err := os.ReadFile(filepath.Join(root, ".midgard", "tasks", "task_planner_checkpoint.mdx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"role: planner status:ready",
+		"role: implementer status:no-op",
+		"role: reviewer status:approved",
+		"cost: $0.000120",
+	} {
+		if !strings.Contains(string(taskReport), want) {
+			t.Fatalf("resumed task report missing %q:\n%s", want, taskReport)
+		}
+	}
+	db, err := state.Open(ctx, filepath.Join(root, ".midgard", "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var leaseState string
+	var fence int64
+	if err := db.Conn().QueryRowContext(ctx, `
+SELECT state, fence
+FROM execution_leases
+WHERE resource_type = 'task' AND resource_id = ?`, "task_planner_checkpoint").Scan(&leaseState, &fence); err != nil {
+		t.Fatal(err)
+	}
+	if leaseState != "released" || fence != 2 {
+		t.Fatalf("execution lease state/fence=%s/%d, want released/2", leaseState, fence)
+	}
+	events, err := db.EventsForTask(ctx, "task_planner_checkpoint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawNormalization bool
+	for _, event := range events {
+		if event.Type == "role.protocol_normalized" && strings.Contains(event.Payload, "inferred_result_artifact") {
+			sawNormalization = true
+		}
+	}
+	if !sawNormalization {
+		t.Fatalf("normalization event missing: %#v", events)
+	}
+}
+
+func TestRunLoopResumesFromAcceptedImplementerCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "implementer-checkpoint-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_implementer_checkpoint", Objective: "replace README heading"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RunRole(ctx, root, "task_implementer_checkpoint", model.RolePlanner, RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RolePlanner: fake.New(fake.Response{Text: "@report plan.mdx\n# Plan\n\nReplace the heading.\n@result status:ready artifact:plan.mdx checks:none\n"}),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	patch := strings.Join([]string{
+		"@report implementation.mdx",
+		"# Implementation",
+		"@payload begin type:patch path:patches/checkpoint.diff",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1 +1 @@",
+		"-# fixture",
+		"+# checkpoint",
+		"@payload end",
+		"@edit file:README.md action:modify mode:patch content:artifact:patches/checkpoint.diff reason:checkpoint repo:repo1",
+		"@result status:ready artifact:implementation.mdx checks:none",
+		"",
+	}, "\n")
+	if _, err := RunRole(ctx, root, "task_implementer_checkpoint", model.RoleImplementer, RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RoleImplementer: fake.New(fake.Response{Text: patch}),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"attempts/planner/1/plan.mdx",
+		"attempts/implementer/1/implementation.mdx",
+	} {
+		if _, err := os.Stat(filepath.Join(root, ".midgard", "artifacts", "task_implementer_checkpoint", filepath.FromSlash(path))); err != nil {
+			t.Fatalf("accepted role checkpoint snapshot %s: %v", path, err)
+		}
+	}
+
+	result, err := RunLoop(ctx, root, "task_implementer_checkpoint", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RoleReviewer: fake.New(fake.Response{Text: "@report review.mdx\n# Review\n\nNo P0/P1 findings.\n@result status:approved artifact:review.mdx findings:none\n"}),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "completed" || len(result.RoleRuns) != 1 || result.RoleRuns[0].Role != model.RoleReviewer {
+		t.Fatalf("resumed result = %#v", result)
+	}
+	patchData, err := os.ReadFile(filepath.Join(root, ".midgard", "artifacts", "task_implementer_checkpoint", "patch.diff"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patchData), "+# checkpoint") {
+		t.Fatalf("patch.diff:\n%s", patchData)
+	}
+}
+
+func TestRunLoopReportsUnknownCostWhenPricingMissing(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "unknown-cost-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_unknown_cost", Objective: "inspect readme"}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RunLoop(ctx, root, "task_unknown_cost", RunnerOptions{
+		ModelID: "unpriced-model",
+		Providers: RoleProviders{
+			model.RolePlanner: fake.New(fake.Response{
+				Text:  "@report plan.mdx\n# Plan\n\nNo-op.\n@result status:ready artifact:plan.mdx checks:none\n",
+				Usage: model.Usage{InputTokens: 10, OutputTokens: 5},
+			}),
+			model.RoleImplementer: fake.New(fake.Response{
+				Text:  "@report implementation.mdx\n# Implementation\n\nNo change needed.\n@result status:no-op artifact:implementation.mdx checks:none\n",
+				Usage: model.Usage{InputTokens: 20, OutputTokens: 10},
+			}),
+			model.RoleReviewer: fake.New(fake.Response{
+				Text:  "@report review.mdx\n# Review\n\nApproved.\n@result status:approved artifact:review.mdx findings:none\n",
+				Usage: model.Usage{InputTokens: 5, OutputTokens: 2},
+			}),
+		},
+		Pricing: cost.Pricing{
+			ID:                   "manual",
+			MissingPricingCaveat: "pricing not configured; usage is recorded but cost is unknown",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CostUSD != 0 || len(result.CostCaveats) != 1 {
+		t.Fatalf("cost result = %#v", result)
+	}
+	taskReport, err := os.ReadFile(filepath.Join(root, ".midgard", "tasks", "task_unknown_cost.mdx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(taskReport), "cost: unknown (pricing not configured; usage is recorded but cost is unknown)") ||
+		strings.Contains(string(taskReport), "cost: $0.000000") {
+		t.Fatalf("task report cost should be unknown:\n%s", taskReport)
+	}
+}
+
+func TestReplaceTaskReportSummaryDropsPreviousGeneratedSections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "task.mdx")
+	original := strings.Join([]string{
+		"# Task task_report",
+		"",
+		"## Objective",
+		"keep this",
+		"",
+		"## Midgard Run Summary",
+		"",
+		"- state: blocked",
+		"",
+		"## Source Edit Summary",
+		"",
+		"- totals: applied:10 failed_apply:20",
+		"",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceTaskReportSummary(path, "\n\n## Midgard Run Summary\n\n- state: completed\n"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "## Objective\nkeep this") ||
+		!strings.Contains(text, "- state: completed") ||
+		strings.Contains(text, "- state: blocked") ||
+		strings.Contains(text, "failed_apply:20") ||
+		strings.Count(text, "## Midgard Run Summary") != 1 {
+		t.Fatalf("unexpected report summary rewrite:\n%s", text)
 	}
 }
 
@@ -563,7 +914,8 @@ func TestRunLoopRepairsPatchApplyFailure(t *testing.T) {
 	packets := implementer.Packets()
 	if len(packets) != 2 || !packets[1].Repair ||
 		!strings.Contains(packets[1].RepairInstructions, "git could not apply the patch") ||
-		!strings.Contains(packets[1].RepairInstructions, "artifact:source-edits/apply-failures/1/stderr.txt") {
+		!strings.Contains(packets[1].RepairInstructions, "artifact:source-edits/apply-failures/1/stderr.txt") ||
+		!strings.Contains(packets[1].RepairInstructions, "unique replacement fallback not applied") {
 		t.Fatalf("repair packet = %#v", packets)
 	}
 
@@ -588,10 +940,22 @@ func TestRunLoopRepairsPatchApplyFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"## Source Edit Summary", "apply_failed attempt:1 file:README.md", "repair_requested after_attempt:1", "applied file:README.md"} {
+	for _, want := range []string{
+		"## Source Edit Summary",
+		"failed_apply:1",
+		"repair_requests:1",
+		"file:README.md applied:1 failed_apply:1",
+		"last_applied:artifact:patches/readme-fixed.diff",
+		"last_failure_attempt:1",
+		"refs:patch:artifact:source-edits/apply-failures/1/patch.diff",
+	} {
 		if !strings.Contains(string(taskReport), want) {
 			t.Fatalf("task report missing %q:\n%s", want, taskReport)
 		}
+	}
+	if strings.Count(string(taskReport), "## Midgard Run Summary") != 1 ||
+		strings.Count(string(taskReport), "## Source Edit Summary") != 1 {
+		t.Fatalf("task report should contain one generated summary:\n%s", taskReport)
 	}
 	db, err := state.Open(ctx, filepath.Join(root, ".midgard", "state.sqlite"))
 	if err != nil {
@@ -603,18 +967,131 @@ func TestRunLoopRepairsPatchApplyFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sawFailure, sawRepair, sawApplied bool
+	var completedRoles, completedImplementers int
 	for _, event := range events {
 		switch event.Type {
 		case "source_edit.apply_failed":
-			sawFailure = strings.Contains(event.Payload, "source-edits/apply-failures/1/stderr.txt")
+			sawFailure = strings.Contains(event.Payload, "source-edits/apply-failures/1/stderr.txt") &&
+				strings.Contains(event.Payload, `"fallback_error":"unique replacement is not safe: removed sequence has 0 line-bounded matches, want exactly 1"`)
 		case "source_edit.repair_requested":
 			sawRepair = true
 		case "source_edit.applied":
 			sawApplied = true
+		case "role.completed":
+			completedRoles++
+			completed, ok := parseRoleCompletedEvent(event.Payload)
+			if ok && completed.Role == model.RoleImplementer {
+				completedImplementers++
+				if completed.Status != "ready" || !strings.Contains(event.Payload, `"attempts":2`) {
+					t.Fatalf("implementer completion = %s", event.Payload)
+				}
+			}
 		}
 	}
-	if !sawFailure || !sawRepair || !sawApplied {
+	if !sawFailure || !sawRepair || !sawApplied || completedRoles != 3 || completedImplementers != 1 {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestRunLoopNormalizesUniqueReplacementWithoutModelRepair(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "unique-replacement-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_unique_replacement", Objective: "change README heading"}); err != nil {
+		t.Fatal(err)
+	}
+
+	malformedContextPatch := strings.Join([]string{
+		"@report implementation.mdx",
+		"# Implementation",
+		"@payload begin type:patch path:patches/readme-context.diff",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1,2 +1,2 @@",
+		" # fixture",
+		"-# fixture",
+		"+# normalized without repair",
+		"@payload end",
+		"@edit file:README.md action:modify mode:patch content:artifact:patches/readme-context.diff reason:normalize repo:repo1",
+		"@result status:ready artifact:implementation.mdx checks:none",
+		"",
+	}, "\n")
+	implementer := fake.New(
+		fake.Response{Text: malformedContextPatch, Usage: model.Usage{InputTokens: 10, OutputTokens: 20}},
+		fake.Response{Text: "this repair response must not be requested"},
+	)
+	result, err := RunLoop(ctx, root, "task_unique_replacement", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RolePlanner:     fake.New(fake.Response{Text: "@report plan.mdx\n# Plan\n\nModify README.\n@result status:ready artifact:plan.mdx checks:none\n"}),
+			model.RoleImplementer: implementer,
+			model.RoleReviewer:    fake.New(fake.Response{Text: "@report review.mdx\n# Review\n\nApproved.\n@result status:approved artifact:review.mdx findings:none\n"}),
+		},
+		MaxSourceEditRepairs: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "completed" || implementer.Calls() != 1 || result.RoleRuns[1].Attempts != 1 {
+		t.Fatalf("result=%#v implementer_calls=%d", result, implementer.Calls())
+	}
+	patch, err := os.ReadFile(filepath.Join(root, ".midgard", "artifacts", "task_unique_replacement", "patch.diff"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patch), "+# normalized without repair") {
+		t.Fatalf("patch.diff:\n%s", patch)
+	}
+
+	db, err := state.Open(ctx, filepath.Join(root, ".midgard", "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events, err := db.EventsForTask(ctx, "task_unique_replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var normalized, applied int
+	for _, event := range events {
+		switch event.Type {
+		case "source_edit.normalized":
+			normalized++
+			var evidence sourceEditNormalizedEvent
+			if err := json.Unmarshal([]byte(event.Payload), &evidence); err != nil {
+				t.Fatal(err)
+			}
+			if evidence.Strategy != "unique-replacement" || evidence.BeforeChecksum == "" || evidence.AfterChecksum == "" ||
+				evidence.BeforeChecksum == evidence.AfterChecksum || evidence.RemovedChecksum == "" || evidence.AddedChecksum == "" ||
+				evidence.RemovedBytes == 0 || evidence.AddedBytes == 0 || !strings.Contains(evidence.OriginalError, "patch") {
+				t.Fatalf("normalization evidence = %#v", evidence)
+			}
+		case "source_edit.applied":
+			applied++
+			if !strings.Contains(event.Payload, `"strategy":"unique-replacement"`) {
+				t.Fatalf("applied event = %s", event.Payload)
+			}
+		case "source_edit.apply_failed", "source_edit.repair_requested":
+			t.Fatalf("unexpected repair event: %#v", event)
+		}
+	}
+	if normalized != 1 || applied != 1 {
+		t.Fatalf("normalized=%d applied=%d events=%#v", normalized, applied, events)
+	}
+	taskReport, err := os.ReadFile(filepath.Join(root, ".midgard", "tasks", "task_unique_replacement.mdx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"applied:1 failed_apply:0 partial_apply:0 normalized:1 repair_requests:0", "file:README.md applied:1 failed_apply:0 partial_apply:0 normalized:1"} {
+		if !strings.Contains(string(taskReport), want) {
+			t.Fatalf("task report missing %q:\n%s", want, taskReport)
+		}
 	}
 }
 
@@ -915,6 +1392,161 @@ func TestRunLoopReworksAfterChangesRequested(t *testing.T) {
 	}
 }
 
+func TestRunLoopReviewerExploresWithCommandBeforeVerdict(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "reviewer-command-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_reviewer_command", Objective: "replace README heading"}); err != nil {
+		t.Fatal(err)
+	}
+	patch := strings.Join([]string{
+		"@report implementation.mdx",
+		"# Implementation",
+		"@payload begin type:patch path:patches/readme.diff",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1 +1 @@",
+		"-# fixture",
+		"+# final",
+		"@payload end",
+		"@edit file:README.md action:modify mode:patch content:artifact:patches/readme.diff reason:heading repo:repo1",
+		"@result status:ready artifact:implementation.mdx checks:none",
+		"",
+	}, "\n")
+	reviewer := fake.New(
+		fake.Response{Text: "@report review.mdx\nNeed to inspect the changed file before verdict.\n@cmd repo:repo1 -- sed -n '1,5p' README.md\n@result status:blocked artifact:review.mdx findings:none\n"},
+		fake.Response{Text: "@report review.mdx\nNo P0/P1 findings. The heading now matches the objective.\n@result status:approved artifact:review.mdx findings:none\n"},
+	)
+	result, err := RunLoop(ctx, root, "task_reviewer_command", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RolePlanner:     fake.New(fake.Response{Text: "@report plan.mdx\n# Plan\n\nModify README.\n@result status:ready artifact:plan.mdx checks:none\n"}),
+			model.RoleImplementer: fake.New(fake.Response{Text: patch}),
+			model.RoleReviewer:    reviewer,
+		},
+		MaxReviewCycles: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "completed" {
+		t.Fatalf("state = %s, want completed", result.State)
+	}
+	if len(result.RoleRuns) != 3 || result.RoleRuns[2].Role != model.RoleReviewer || result.RoleRuns[2].Attempts != 2 {
+		t.Fatalf("role runs = %#v, want reviewer with two attempts", result.RoleRuns)
+	}
+	packets := reviewer.Packets()
+	if len(packets) != 2 ||
+		!strings.Contains(packets[1].UserContent(), "Continue the same reviewer role") ||
+		!strings.Contains(packets[1].UserContent(), "# final") {
+		t.Fatalf("reviewer continuation missing command output:\n%v", packets)
+	}
+	db, err := state.Open(ctx, filepath.Join(root, ".midgard", "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events, err := db.EventsForTask(ctx, "task_reviewer_command")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawCommand bool
+	for _, event := range events {
+		if event.Type == "command.finished" && strings.Contains(event.Payload, "sed -n '1,5p' README.md") {
+			sawCommand = true
+		}
+	}
+	if !sawCommand {
+		t.Fatalf("events = %#v, want reviewer command.finished", events)
+	}
+}
+
+func TestRunLoopReviewerRecoversFromRejectedMutationCommand(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "reviewer-command-policy-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_reviewer_policy", Objective: "replace README heading"}); err != nil {
+		t.Fatal(err)
+	}
+	patch := strings.Join([]string{
+		"@report implementation.mdx",
+		"# Implementation",
+		"@payload begin type:patch path:patches/reviewer-policy.diff",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1 +1 @@",
+		"-# fixture",
+		"+# final",
+		"@payload end",
+		"@edit file:README.md action:modify mode:patch content:artifact:patches/reviewer-policy.diff reason:heading repo:repo1",
+		"@result status:ready artifact:implementation.mdx checks:none",
+		"",
+	}, "\n")
+	reviewer := fake.New(
+		fake.Response{Text: "@report review.mdx\nNeed to alter the file before deciding.\n@cmd repo:repo1 -- printf '# reviewer' > README.md\n"},
+		fake.Response{Text: "@report review.mdx\nThe mutation command was correctly rejected. No P0/P1 findings remain.\n@result status:approved artifact:review.mdx findings:none\n"},
+	)
+	result, err := RunLoop(ctx, root, "task_reviewer_policy", RunnerOptions{
+		ModelID: "fake-model",
+		Providers: RoleProviders{
+			model.RolePlanner:     fake.New(fake.Response{Text: "@report plan.mdx\n# Plan\n\nModify README.\n@result status:ready artifact:plan.mdx checks:none\n"}),
+			model.RoleImplementer: fake.New(fake.Response{Text: patch}),
+			model.RoleReviewer:    reviewer,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "completed" || reviewer.Calls() != 2 {
+		t.Fatalf("result = %#v reviewer calls=%d", result, reviewer.Calls())
+	}
+	packets := reviewer.Packets()
+	if len(packets) != 2 || !strings.Contains(packets[1].UserContent(), "rejected:true") || !strings.Contains(packets[1].UserContent(), "redirection") {
+		t.Fatalf("reviewer rejection continuation missing evidence:\n%v", packets)
+	}
+	status, err := Status(ctx, root, "task_reviewer_policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(status.Worktrees[0].Path, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "# final\n" {
+		t.Fatalf("canonical worktree was mutated by reviewer: %q", data)
+	}
+	db, err := state.Open(ctx, filepath.Join(root, ".midgard", "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events, err := db.EventsForTask(ctx, "task_reviewer_policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rejected bool
+	for _, event := range events {
+		if event.Type == "command.rejected" && strings.Contains(event.Payload, "printf") {
+			rejected = true
+		}
+	}
+	if !rejected {
+		t.Fatalf("events = %#v, want command.rejected", events)
+	}
+}
+
 func TestRunLoopResumesFromChangesRequestedReview(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -997,6 +1629,7 @@ func TestRunLoopResumesFromChangesRequestedReview(t *testing.T) {
 		t.Fatalf("implementer packets = %d, want 1", len(packets))
 	}
 	if !strings.Contains(packets[0].Context, "latest_role_reports") ||
+		!strings.Contains(packets[0].Context, "review_findings") ||
 		!strings.Contains(packets[0].Context, "role:reviewer status:changes-requested artifact:review.mdx") ||
 		!strings.Contains(packets[0].Context, "wrong heading") ||
 		!strings.Contains(packets[0].Context, "worktree_diff") ||

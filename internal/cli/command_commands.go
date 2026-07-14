@@ -31,7 +31,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 }
 
-func runCommandRun(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func runCommandRun(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr error) {
 	fs := flag.NewFlagSet("midgard command run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	root := fs.String("root", "", "workbench root or search start")
@@ -56,6 +56,16 @@ func runCommandRun(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if *taskID == "" {
 		return fmt.Errorf("task id is required")
 	}
+	execution, err := midgardtask.AcquireExecution(ctx, wbStatus.Root, *taskID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := execution.Close(); retErr == nil && err != nil {
+			retErr = err
+		}
+	}()
+	ctx = execution.Context
 	taskStatus, err := midgardtask.Status(ctx, wbStatus.Root, *taskID)
 	if err != nil {
 		return err
@@ -85,8 +95,12 @@ func runCommandRun(ctx context.Context, args []string, stdout, stderr io.Writer)
 		Command:     commandLine,
 		CWD:         cwd,
 		ArtifactDir: artifactDir,
+		Fence:       midgardtask.CheckExecution,
 	})
 	if err != nil {
+		return err
+	}
+	if err := midgardtask.CheckExecution(ctx); err != nil {
 		return err
 	}
 	if err := persistCommandEvents(ctx, wbStatus.Root, result); err != nil {
@@ -106,7 +120,7 @@ func runCommandRun(ctx context.Context, args []string, stdout, stderr io.Writer)
 	return nil
 }
 
-func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) (retErr error) {
 	if len(args) == 0 {
 		printCheckUsage(stdout)
 		return nil
@@ -135,6 +149,16 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			return err
 		}
 		layout := workbench.NewLayout(wbStatus.Root)
+		execution, err := midgardtask.AcquireExecution(ctx, wbStatus.Root, *taskID)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := execution.Close(); retErr == nil && err != nil {
+				retErr = err
+			}
+		}()
+		ctx = execution.Context
 		db, err := state.Open(ctx, layout.State)
 		if err != nil {
 			return err
@@ -142,6 +166,9 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		defer db.Close()
 		payload, err := json.Marshal(map[string]string{"id": *id, "status": *statusValue, "summary": *summary})
 		if err != nil {
+			return err
+		}
+		if err := midgardtask.CheckExecution(ctx); err != nil {
 			return err
 		}
 		eventID, err := db.InsertEvent(ctx, state.Event{TaskID: *taskID, Type: "check.recorded", Payload: string(payload)})

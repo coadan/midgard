@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"path/filepath"
 
@@ -29,6 +30,18 @@ func (api *API) handleCommandRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	execution, err := midgardtask.AcquireExecution(r.Context(), api.root, req.TaskID)
+	if err != nil {
+		var heldErr state.ExecutionLeaseHeldError
+		if errors.As(err, &heldErr) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defer execution.Close()
+	r = r.WithContext(execution.Context)
 	taskStatus, err := midgardtask.Status(r.Context(), api.root, req.TaskID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -56,6 +69,7 @@ func (api *API) handleCommandRun(w http.ResponseWriter, r *http.Request) {
 		CWD:         cwd,
 		ArtifactDir: artifactDir,
 		Env:         req.Env,
+		Fence:       midgardtask.CheckExecution,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

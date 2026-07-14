@@ -41,12 +41,27 @@ func (e Executor) Run(ctx context.Context, req Request) (Result, error) {
 	if err := e.Policy.ValidateCWD(req.CWD); err != nil {
 		return Result{}, err
 	}
+	if err := e.Policy.ValidateCommand(req.Command); err != nil {
+		return Result{}, err
+	}
+	if req.Fence != nil {
+		if err := req.Fence(ctx); err != nil {
+			return Result{}, err
+		}
+	}
 	if err := os.MkdirAll(req.ArtifactDir, 0o755); err != nil {
 		return Result{}, err
 	}
 	id := req.ID
 	if id == "" {
 		id = newCommandID()
+	}
+	prefix := req.ArtifactPrefix
+	if prefix == "" {
+		prefix = filepath.ToSlash(filepath.Join("commands", id))
+	}
+	if err := artifact.ValidatePath(prefix); err != nil {
+		return Result{}, fmt.Errorf("artifact prefix: %w", err)
 	}
 	result := Result{
 		ID:        id,
@@ -91,30 +106,41 @@ func (e Executor) Run(ctx context.Context, req Request) (Result, error) {
 			result.ExitCode = -1
 		}
 	}
+	if req.Fence != nil {
+		if err := req.Fence(ctx); err != nil {
+			return Result{}, err
+		}
+	}
 
 	afterStatus, _ := gitrepo.Run(ctx, req.CWD, "status", "--porcelain")
 	result.TouchedFiles = touchedFiles(beforeStatus, afterStatus)
 
 	store := artifact.NewStore(req.ArtifactDir)
-	stdoutPath := filepath.ToSlash(filepath.Join("commands", id, "stdout.txt"))
-	stderrPath := filepath.ToSlash(filepath.Join("commands", id, "stderr.txt"))
-	resultPath := filepath.ToSlash(filepath.Join("commands", id, "result.json"))
-	if _, err := store.Put(artifact.Record{Path: stdoutPath, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "text"}, stdout.bytes()); err != nil {
+	stdoutPath := filepath.ToSlash(filepath.Join(prefix, "stdout.txt"))
+	stderrPath := filepath.ToSlash(filepath.Join(prefix, "stderr.txt"))
+	resultPath := filepath.ToSlash(filepath.Join(prefix, "result.json"))
+	stdoutRec, err := store.Put(artifact.Record{Path: stdoutPath, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "text"}, stdout.bytes())
+	if err != nil {
 		return Result{}, err
 	}
-	if _, err := store.Put(artifact.Record{Path: stderrPath, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "text"}, stderr.bytes()); err != nil {
+	stderrRec, err := store.Put(artifact.Record{Path: stderrPath, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "text"}, stderr.bytes())
+	if err != nil {
 		return Result{}, err
 	}
 	result.StdoutPath = stdoutPath
 	result.StderrPath = stderrPath
 	result.ResultPath = resultPath
+	result.StdoutChecksum = stdoutRec.Checksum
+	result.StderrChecksum = stderrRec.Checksum
 	resultJSON, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return Result{}, err
 	}
-	if _, err := store.Put(artifact.Record{Path: resultPath, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "json"}, append(resultJSON, '\n')); err != nil {
+	resultRec, err := store.Put(artifact.Record{Path: resultPath, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "json"}, append(resultJSON, '\n'))
+	if err != nil {
 		return Result{}, err
 	}
+	result.ResultChecksum = resultRec.Checksum
 	return result, nil
 }
 

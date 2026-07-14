@@ -9,7 +9,10 @@ import (
 	"slices"
 	"strings"
 
+	midgardforge "midgard/internal/forge"
 	"midgard/internal/gitrepo"
+	"midgard/internal/model"
+	"midgard/internal/review"
 	"midgard/internal/state"
 	"midgard/internal/workbench"
 )
@@ -41,6 +44,11 @@ func contextPacket(ctx context.Context, status StatusResult, layout workbench.La
 		b.WriteString(fmt.Sprintf("%t", wt.Dirty))
 		b.WriteByte('\n')
 	}
+	forgeDigest := forgeDigestContext(ctx, layout, status.Task.ID)
+	if forgeDigest != "" {
+		b.WriteString("\nforge_prs:\n")
+		b.WriteString(forgeDigest)
+	}
 	fileIndex := objectiveFileIndex(status.Task.Objective, status.Worktrees)
 	if fileIndex != "" {
 		b.WriteString("\nrepo_file_index:\n")
@@ -61,6 +69,11 @@ func contextPacket(ctx context.Context, status StatusResult, layout workbench.La
 		b.WriteString("\nlatest_role_statuses:\n")
 		b.WriteString(roleStatuses)
 	}
+	reviewFindings := latestReviewFindingsContext(ctx, layout, status.Task.ID)
+	if reviewFindings != "" {
+		b.WriteString("\nreview_findings:\n")
+		b.WriteString(reviewFindings)
+	}
 	feedback := latestFeedbackContext(ctx, layout, status.Task.ID)
 	if feedback != "" {
 		b.WriteString("\nlatest_feedback:\n")
@@ -72,6 +85,15 @@ func contextPacket(ctx context.Context, status StatusResult, layout workbench.La
 		b.WriteString(reports)
 	}
 	return b.String()
+}
+
+func forgeDigestContext(ctx context.Context, layout workbench.Layout, taskID string) string {
+	db, err := state.Open(ctx, layout.State)
+	if err != nil {
+		return ""
+	}
+	defer db.Close()
+	return midgardforge.Digest(ctx, layout.Root, db, taskID)
 }
 
 func latestRoleStatusContext(ctx context.Context, layout workbench.Layout, taskID string) string {
@@ -152,6 +174,55 @@ func latestFeedbackContext(ctx context.Context, layout workbench.Layout, taskID 
 	}
 	b.WriteString(message)
 	if !strings.HasSuffix(message, "\n") {
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func latestReviewFindingsContext(ctx context.Context, layout workbench.Layout, taskID string) string {
+	db, err := state.Open(ctx, layout.State)
+	if err != nil {
+		return ""
+	}
+	defer db.Close()
+	events, err := db.EventsForTask(ctx, taskID)
+	if err != nil {
+		return ""
+	}
+	var latest roleStatus
+	var ok bool
+	for _, event := range events {
+		if event.Type != "role.completed" {
+			continue
+		}
+		completed, parsed := parseRoleCompletedEvent(event.Payload)
+		if !parsed || completed.Role != model.RoleReviewer {
+			continue
+		}
+		latest = completed
+		ok = true
+	}
+	if !ok || latest.Status != string(review.VerdictChangesRequested) {
+		return ""
+	}
+	artifactPath := latest.Artifact
+	if artifactPath == "" {
+		artifactPath = "review.mdx"
+	}
+	data, err := os.ReadFile(filepath.Join(layout.Artifacts, taskID, artifactPath))
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	text := string(data)
+	if len(text) > maxReportContextBytes {
+		text = text[:maxReportContextBytes] + "\n[review findings truncated]\n"
+	}
+	var b strings.Builder
+	b.WriteString("artifact:")
+	b.WriteString(artifactPath)
+	b.WriteByte('\n')
+	b.WriteString(text)
+	if !strings.HasSuffix(text, "\n") {
 		b.WriteByte('\n')
 	}
 	return b.String()

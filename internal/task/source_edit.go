@@ -27,8 +27,25 @@ type sourceEditAppliedEvent struct {
 	Mode            string `json:"mode"`
 	Reason          string `json:"reason"`
 	Content         string `json:"content"`
+	Strategy        string `json:"strategy"`
 	BeforePorcelain string `json:"before_porcelain"`
 	AfterPorcelain  string `json:"after_porcelain"`
+}
+
+type sourceEditNormalizedEvent struct {
+	FrameID         int    `json:"frame_id"`
+	Role            string `json:"role"`
+	RepoID          string `json:"repo_id"`
+	File            string `json:"file"`
+	Content         string `json:"content"`
+	Strategy        string `json:"strategy"`
+	OriginalError   string `json:"original_error"`
+	BeforeChecksum  string `json:"before_checksum"`
+	AfterChecksum   string `json:"after_checksum"`
+	RemovedChecksum string `json:"removed_checksum"`
+	AddedChecksum   string `json:"added_checksum"`
+	RemovedBytes    int    `json:"removed_bytes"`
+	AddedBytes      int    `json:"added_bytes"`
 }
 
 type sourceEditApplyFailedEvent struct {
@@ -47,6 +64,7 @@ type sourceEditApplyFailedEvent struct {
 	Stderr                string `json:"stderr"`
 	BeforePorcelain       string `json:"before_porcelain"`
 	PartialApplied        bool   `json:"partial_applied"`
+	FallbackError         string `json:"fallback_error,omitempty"`
 	FailedPatchArtifact   string `json:"failed_patch_artifact"`
 	StderrArtifact        string `json:"stderr_artifact"`
 	SourceContextArtifact string `json:"source_context_artifact"`
@@ -87,11 +105,17 @@ func (f *sourceEditApplyFailure) modelFailure(store artifact.Store) model.Source
 }
 
 func applySourceEdits(ctx context.Context, db *state.DB, taskID string, role model.Role, worktrees []WorktreeStatus, store artifact.Store, parsed *stream.ParseResult, attempt, maxRepairs int) (*sourceEditApplyFailure, error) {
+	if err := CheckExecution(ctx); err != nil {
+		return nil, err
+	}
 	if parsed == nil || role != model.RoleImplementer {
 		return nil, nil
 	}
 	appliedPatchArtifacts := map[string]bool{}
 	for _, edit := range parsed.Edits {
+		if err := CheckExecution(ctx); err != nil {
+			return nil, err
+		}
 		if edit.Mode != "patch" {
 			continue
 		}
@@ -133,15 +157,51 @@ func applyPatchEdit(ctx context.Context, db *state.DB, taskID string, role model
 		return nil, err
 	}
 	patch = sanitizePatchPayload(patch)
+	if err := CheckExecution(ctx); err != nil {
+		return nil, err
+	}
 	before, _ := gitrepo.WorktreeStatus(ctx, wt.Path)
-	if err := gitrepo.ApplyPatchWithRejects(ctx, wt.Path, patch); err != nil {
-		failure, persistErr := persistSourceEditApplyFailure(ctx, db, taskID, role, wt, store, edit, contentPath, patch, before.Porcelain, err, attempt, maxRepairs)
+	if applyErr := gitrepo.ApplyPatchWithRejects(ctx, wt.Path, patch); applyErr != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		var fallbackErr error
+		var typedApplyErr *gitrepo.ApplyPatchError
+		switch {
+		case edit.Action != "modify":
+			fallbackErr = fmt.Errorf("action %q is not an in-place modification", edit.Action)
+		case !errors.As(applyErr, &typedApplyErr):
+			fallbackErr = fmt.Errorf("git apply error is not structured")
+		case typedApplyErr.Partial:
+			fallbackErr = fmt.Errorf("failed git apply changed the worktree")
+		default:
+			if err := CheckExecution(ctx); err != nil {
+				return nil, err
+			}
+			normalized, err := gitrepo.ApplyUniqueReplacement(wt.Path, edit.File, patch)
+			if err == nil {
+				after, _ := gitrepo.WorktreeStatus(ctx, wt.Path)
+				if err := recordSourceEditNormalized(ctx, db, taskID, role, wt, edit, contentPath, applyErr, normalized); err != nil {
+					return nil, err
+				}
+				if err := recordSourceEditApplied(ctx, db, taskID, role, wt, edit, contentPath, "unique-replacement", before.Porcelain, after.Porcelain); err != nil {
+					return nil, err
+				}
+				return nil, nil
+			}
+			fallbackErr = err
+		}
+		failure, persistErr := persistSourceEditApplyFailure(ctx, db, taskID, role, wt, store, edit, contentPath, patch, before.Porcelain, applyErr, fallbackErr, attempt, maxRepairs)
 		if persistErr != nil {
 			return nil, persistErr
 		}
 		return failure, nil
 	}
 	after, _ := gitrepo.WorktreeStatus(ctx, wt.Path)
+	return nil, recordSourceEditApplied(ctx, db, taskID, role, wt, edit, contentPath, "git-apply", before.Porcelain, after.Porcelain)
+}
+
+func recordSourceEditApplied(ctx context.Context, db *state.DB, taskID string, role model.Role, wt WorktreeStatus, edit stream.EditIntent, contentPath, strategy, beforePorcelain, afterPorcelain string) error {
 	payload, err := json.Marshal(sourceEditAppliedEvent{
 		FrameID:         edit.FrameID,
 		Role:            role.String(),
@@ -151,21 +211,50 @@ func applyPatchEdit(ctx context.Context, db *state.DB, taskID string, role model
 		Mode:            edit.Mode,
 		Reason:          edit.Reason,
 		Content:         "artifact:" + contentPath,
-		BeforePorcelain: before.Porcelain,
-		AfterPorcelain:  after.Porcelain,
+		Strategy:        strategy,
+		BeforePorcelain: beforePorcelain,
+		AfterPorcelain:  afterPorcelain,
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	_, err = db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "source_edit.applied", Payload: string(payload)})
-	return nil, err
+	return err
 }
 
-func persistSourceEditApplyFailure(ctx context.Context, db *state.DB, taskID string, role model.Role, wt WorktreeStatus, store artifact.Store, edit stream.EditIntent, contentPath string, patch []byte, beforePorcelain string, applyErr error, attempt, maxRepairs int) (*sourceEditApplyFailure, error) {
+func recordSourceEditNormalized(ctx context.Context, db *state.DB, taskID string, role model.Role, wt WorktreeStatus, edit stream.EditIntent, contentPath string, applyErr error, normalized gitrepo.UniqueReplacementResult) error {
+	payload, err := json.Marshal(sourceEditNormalizedEvent{
+		FrameID:         edit.FrameID,
+		Role:            role.String(),
+		RepoID:          wt.RepoID,
+		File:            edit.File,
+		Content:         "artifact:" + contentPath,
+		Strategy:        "unique-replacement",
+		OriginalError:   applyErr.Error(),
+		BeforeChecksum:  normalized.BeforeChecksum,
+		AfterChecksum:   normalized.AfterChecksum,
+		RemovedChecksum: normalized.RemovedChecksum,
+		AddedChecksum:   normalized.AddedChecksum,
+		RemovedBytes:    normalized.RemovedBytes,
+		AddedBytes:      normalized.AddedBytes,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "source_edit.normalized", Payload: string(payload)})
+	return err
+}
+
+func persistSourceEditApplyFailure(ctx context.Context, db *state.DB, taskID string, role model.Role, wt WorktreeStatus, store artifact.Store, edit stream.EditIntent, contentPath string, patch []byte, beforePorcelain string, applyErr, fallbackErr error, attempt, maxRepairs int) (*sourceEditApplyFailure, error) {
 	stderr := strings.TrimSpace(applyErr.Error())
 	var gitApplyErr *gitrepo.ApplyPatchError
 	if errors.As(applyErr, &gitApplyErr) && strings.TrimSpace(gitApplyErr.Stderr) != "" {
 		stderr = strings.TrimSpace(gitApplyErr.Stderr)
+	}
+	fallbackMessage := ""
+	if fallbackErr != nil {
+		fallbackMessage = fallbackErr.Error()
+		stderr += "\n\nunique replacement fallback not applied: " + fallbackMessage
 	}
 	prefix := fmt.Sprintf("source-edits/apply-failures/%d", attempt)
 	patchRec, err := putSourceEditDiagnostic(ctx, db, taskID, role, store, artifact.Record{
@@ -215,6 +304,7 @@ func persistSourceEditApplyFailure(ctx context.Context, db *state.DB, taskID str
 		Stderr:                stderr,
 		BeforePorcelain:       beforePorcelain,
 		PartialApplied:        gitApplyErr != nil && gitApplyErr.Partial,
+		FallbackError:         fallbackMessage,
 		FailedPatchArtifact:   patchRec.Path,
 		StderrArtifact:        stderrRec.Path,
 		SourceContextArtifact: contextRec.Path,
@@ -230,6 +320,9 @@ func persistSourceEditApplyFailure(ctx context.Context, db *state.DB, taskID str
 }
 
 func putSourceEditDiagnostic(ctx context.Context, db *state.DB, taskID string, role model.Role, store artifact.Store, rec artifact.Record, data []byte) (artifact.Record, error) {
+	if err := CheckExecution(ctx); err != nil {
+		return artifact.Record{}, err
+	}
 	stored, err := store.Put(rec, data)
 	if err != nil {
 		return artifact.Record{}, err

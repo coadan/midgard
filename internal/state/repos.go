@@ -9,7 +9,7 @@ type Workbench struct {
 }
 
 func (db *DB) UpsertWorkbench(ctx context.Context, wb Workbench) error {
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := db.fencedExecContext(ctx, `
 INSERT INTO workbenches (id, root, config_path)
 VALUES (?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET

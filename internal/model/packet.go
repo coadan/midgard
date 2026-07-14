@@ -91,8 +91,26 @@ func RepairPacket(base Packet, repair *stream.RepairPacket) Packet {
 	if err != nil {
 		reportPath = repair.ReportArtifact
 	}
+	if repair.Mode == "result-only" {
+		base.RepairInstructions = fmt.Sprintf(`Repair only the unresolved final result frame from the previous Midgard stream.
+Midgard preserved the accepted report, payloads, edits, commands, refs, and frame ids.
+Emit exactly one corrected @result line and nothing else. Do not repeat @report or report prose.
+Use the canonical report artifact for this role: %s.
+
+required_shape:
+%s
+
+remaining_repair_attempts:%d
+parser_issues:
+%s
+accepted_last_frame:%d
+sealed_payloads:%v
+raw_tail:
+%s`, reportPath, repair.ResultTemplate, repair.RemainingAttempts, formatRepairIssues(repair.Issues), repair.LastFrameID, repair.SealedPayloadRefs, repair.RawTail)
+		return base
+	}
 	base.RepairInstructions = fmt.Sprintf(`Repair the previous Midgard stream.
-The repair response is parsed independently; it must be a complete valid stream.
+The replacement response is parsed independently; it must be a complete valid stream.
 Start the repair response with exactly @report %s.
 Do not emit @result until every required @payload, @edit, and @cmd frame has already been emitted.
 End with exactly one @result line whose artifact is %s, and emit nothing after it.
@@ -101,19 +119,50 @@ Use the required report artifact for this role: %s.
 Do not use repair.mdx or any other report path.
 If raw_tail shows frames after an earlier @result, re-emit the intended frames in valid order before the final @result.
 
-error_codes:%v
-last_frame:%d
+remaining_repair_attempts:%d
+parser_issues:
+%s
+accepted_last_frame:%d
 report:%s
 draft_payloads:%v
+sealed_payloads:%v
 raw_tail:
-%s`, reportPath, reportPath, reportPath, repair.ErrorCodes, repair.LastFrameID, repair.ReportArtifact, repair.DraftPayloadRefs, repair.RawTail)
+%s`, reportPath, reportPath, reportPath, repair.RemainingAttempts, formatRepairIssues(repair.Issues), repair.LastFrameID, repair.ReportArtifact, repair.DraftPayloadRefs, repair.SealedPayloadRefs, repair.RawTail)
 	return base
+}
+
+func formatRepairIssues(issues []stream.RepairIssue) string {
+	if len(issues) == 0 {
+		return "- none"
+	}
+	var b strings.Builder
+	for _, issue := range issues {
+		fmt.Fprintf(&b, "- code:%s line:%d message:%s\n", issue.Code, issue.Line, strings.ReplaceAll(issue.Message, "\n", " "))
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func CommandContinuationPacket(base Packet, parsed *stream.ParseResult, commandResults string) Packet {
 	reportPath, err := base.Role.ReportPath()
 	if err != nil {
 		reportPath = ""
+	}
+	if base.Role == RoleReviewer {
+		base.ProviderInstruction = fmt.Sprintf(`Continue the same reviewer role after executing your requested command(s).
+Use the command results below as evidence. Do not claim command output you do not see.
+Open with @report %s, write a concise review update, and either:
+- emit more read-only @cmd lines if another bounded inspection/check is required, without @result, or
+- end with exactly one @result line when the review verdict is ready.
+Do not emit @payload or @edit. Reviewer commands are for inspection/checks, not source mutation.
+Keep review findings high-signal: correctness, security, behavior regressions, and missing tests for changed behavior.
+Return status:approved only when there are no P0/P1 findings. Return status:changes-requested when any P0/P1 finding remains.
+
+previous_stream_tail:
+%s
+
+command_results:
+%s`, reportPath, packetRawTail(parsed.Raw, 2048), commandResults)
+		return base
 	}
 	base.ProviderInstruction = fmt.Sprintf(`Continue the same Midgard role after executing your requested command(s).
 Use the command results below as evidence. Do not claim command output you do not see.
@@ -137,6 +186,22 @@ func UnproductiveCommandContinuationPacket(base Packet, parsed *stream.ParseResu
 	if err != nil {
 		reportPath = ""
 	}
+	if base.Role == RoleReviewer {
+		base.ProviderInstruction = fmt.Sprintf(`Continue the same reviewer role.
+Your previous continuation returned a terminal status after command output, but Midgard did not accept it because it still described missing context.
+Open with @report %s, write a concise review update, and choose one:
+- if more source context is needed, emit narrow read-only @cmd lines and no @result;
+- if the command output is enough, end with status:approved or status:changes-requested;
+- if the task truly cannot be reviewed, end with status:blocked and name the exact blocker that no further bounded command can resolve.
+Do not emit @payload or @edit.
+
+previous_terminal_stream_tail:
+%s
+
+command_results:
+%s`, reportPath, packetRawTail(parsed.Raw, 2048), commandResults)
+		return base
+	}
 	base.ProviderInstruction = fmt.Sprintf(`Continue the same Midgard role.
 Your previous continuation returned a terminal status after command output, but Midgard did not accept it because it did not include edits, follow-up @cmd, or a concrete external blocker.
 Open with @report %s, write a concise updated report, and choose one:
@@ -157,6 +222,23 @@ func CommandContinuationLimitPacket(base Packet, parsed *stream.ParseResult, com
 	reportPath, err := base.Role.ReportPath()
 	if err != nil {
 		reportPath = ""
+	}
+	if base.Role == RoleReviewer {
+		base.ProviderInstruction = fmt.Sprintf(`Continue the same reviewer role.
+Command inspection budget is exhausted after %d command continuation turns.
+Midgard will not execute more @cmd lines for this role.
+Open with @report %s, write a concise final review, do not emit @cmd, and end with exactly one @result:
+- status:approved if there are no P0/P1 findings;
+- status:changes-requested if any P0/P1 finding remains;
+- status:blocked only for a concrete external blocker.
+Do not emit @payload or @edit.
+
+requested_command_stream_tail:
+%s
+
+command_results:
+%s`, maxCommandTurns, reportPath, packetRawTail(parsed.Raw, 2048), commandResults)
+		return base
 	}
 	base.ProviderInstruction = fmt.Sprintf(`Continue the same Midgard role.
 Command inspection budget is exhausted after %d command continuation turns.
@@ -204,6 +286,20 @@ func UnproductiveTerminalPacket(base Packet, parsed *stream.ParseResult) Packet 
 	if err != nil {
 		reportPath = ""
 	}
+	if base.Role == RoleReviewer {
+		base.ProviderInstruction = fmt.Sprintf(`Continue the same reviewer role.
+Your previous response returned a terminal status because more inspection was needed, but it did not emit @cmd.
+Midgard did not accept that as completed review output.
+Open with @report %s and choose one:
+- if more source context is needed, emit narrow read-only @cmd lines and no @result;
+- if enough context is available, end with status:approved or status:changes-requested;
+- if the task truly cannot be reviewed, end with status:blocked and name the exact blocker that no further bounded command can resolve.
+Do not emit @payload or @edit.
+
+previous_terminal_stream_tail:
+%s`, reportPath, packetRawTail(parsed.Raw, 2048))
+		return base
+	}
 	base.ProviderInstruction = fmt.Sprintf(`Continue the same Midgard role.
 Your previous response returned a terminal status because more inspection was needed, but it did not emit @cmd and did not make source edits.
 Midgard did not accept that as completed output.
@@ -228,10 +324,14 @@ func SourceEditRepairPacket(base Packet, failure SourceEditApplyFailure) Packet 
 	base.Repair = true
 	base.RepairInstructions = fmt.Sprintf(`Repair the previous implementer source edit.
 The Midgard stream parsed successfully, but git could not apply the patch.
-Open with @report implementation.mdx, write only a short repair note, emit a corrected patch payload and @edit, then end with @result.
+Open with @report implementation.mdx and write only a short repair note.
 Patch the current worktree state. Do not reuse the failed patch unchanged. Earlier edits from the previous stream may already be applied.
 If partial_applied is true, preserve the current diff and emit only the remaining correction needed on top of it.
-Use compact output and hydrate diagnostics from artifact refs instead of repeating them.
+Treat source_context_preview as authoritative: copy exact adjacent source lines, not context remembered from the failed patch.
+For a corrected patch, use narrow hunks with exact current context, emit the patch payload and @edit, then end with @result.
+For repeated literal replacements where another patch would be fragile, emit a sealed Python script payload, a mode:script @edit, and an @cmd that runs the script from artifact_dir before @result.
+If the exact current text is still unclear, emit a narrow read-only @cmd and no @result so Midgard can return the output.
+Use compact output and do not repeat the full diagnostics.
 
 attempt:%d
 remaining_attempts:%d
@@ -332,6 +432,7 @@ Use mode:patch @edit frames for direct source edits. Use shell command proposals
 If source_context is insufficient, inspect with @cmd repo:<repo-id> -- <command> and wait for command results before editing.
 Do not return blocked solely because file context is missing while @cmd inspection can still gather it.
 Prefer rg/sed/git commands for inspection. Do not use @cmd to make source edits unless executing an audited generated artifact.
+If review_findings is present, address every P0/P1 finding against the current worktree_diff before returning ready.
 If latest_role_statuses or latest_role_reports contains a changes-requested review, fix that review against the current worktree_diff.
 Patch the current worktree state; do not reapply the same rejected patch.
 Allowed implementer statuses: ready, no-op, blocked, failed.`
@@ -339,13 +440,25 @@ Allowed implementer statuses: ready, no-op, blocked, failed.`
 		return `Reviewer output must start with exactly:
 @report review.mdx
 
-Reviewer is read-only by default. Review the actual worktree_diff, not just implementation prose.
-Approve only when the diff satisfies the objective. Request changes if the old defect remains,
-the patch duplicates text, the diff is empty for an edit task, or the implementation report
-claims a change that the diff does not show. End with exactly one:
-@result status:approved artifact:review.mdx findings:<ids-or-none>
+Act like a high-signal Codex code review pass. Review the actual worktree_diff, not just implementation prose.
+Focus on P0/P1 findings: correctness bugs, security/privacy risks, behavior regressions, broken API contracts,
+missing tests for changed behavior, and task-objective gaps. Avoid style-only comments unless they hide a real bug.
+Approve only when the diff satisfies the objective and no P0/P1 finding remains.
+Request changes if the old defect remains, the patch duplicates text, the diff is empty for an edit task,
+the implementation report claims a change that the diff does not show, or tests/evidence are materially missing.
 
-Do not emit @payload, @edit, or @cmd.
+You may inspect like any other role: emit read-only @cmd repo:<repo-id> -- <command> lines and no @result when you need
+bounded source context, git diff details, or check output before deciding. Prefer rg, sed, git diff/show/status,
+and focused test/check commands. Do not use reviewer @cmd to mutate source files.
+
+When findings exist, write them in review.mdx as concise bullets with severity/id, path/line if known,
+evidence, impact, and the expected fix. End with exactly one:
+@result status:changes-requested artifact:review.mdx findings:<ids>
+
+When no P0/P1 findings remain, state that and end with exactly one:
+@result status:approved artifact:review.mdx findings:none
+
+Do not emit @payload or @edit.
 Allowed reviewer statuses: approved, changes-requested, blocked, failed.`
 	case RoleCompactor:
 		return `Compactor output must start with exactly:

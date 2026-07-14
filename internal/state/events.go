@@ -10,7 +10,7 @@ type Event struct {
 }
 
 func (db *DB) InsertEvent(ctx context.Context, event Event) (int64, error) {
-	result, err := db.conn.ExecContext(ctx, `
+	result, err := db.fencedExecContext(ctx, `
 INSERT INTO events (task_id, type, payload)
 VALUES (?, ?, ?)`,
 		nullableString(event.TaskID),

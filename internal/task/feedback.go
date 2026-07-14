@@ -22,7 +22,17 @@ type feedbackStatus struct {
 	Message string
 }
 
-func RecordFeedback(ctx context.Context, root, taskID string, input FeedbackInput) error {
+func RecordFeedback(ctx context.Context, root, taskID string, input FeedbackInput) (retErr error) {
+	execution, err := AcquireExecution(ctx, root, taskID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := execution.Close(); retErr == nil && err != nil {
+			retErr = err
+		}
+	}()
+	ctx = execution.Context
 	status := strings.TrimSpace(input.Status)
 	if status == "" {
 		status = "changes-requested"
@@ -53,6 +63,9 @@ func RecordFeedback(ctx context.Context, root, taskID string, input FeedbackInpu
 		Message: message,
 	})
 	if err != nil {
+		return err
+	}
+	if err := CheckExecution(ctx); err != nil {
 		return err
 	}
 	if _, err := db.InsertEvent(ctx, state.Event{TaskID: taskID, Type: "feedback.received", Payload: string(payload)}); err != nil {

@@ -61,6 +61,7 @@ func (p Parser) Parse(r io.Reader) (*ParseResult, error) {
 	payloads := map[string]*payloadDraft{}
 	var activeReport *reportDraft
 	var activePayload *payloadDraft
+	var discardPayload bool
 	var totalReportBytes int64
 	var totalPayloadBytes int64
 	var commandCount int
@@ -78,6 +79,12 @@ func (p Parser) Parse(r io.Reader) (*ParseResult, error) {
 		for _, span := range spans {
 			if p.Budget.MaxLineBytes > 0 && len(span.text) > p.Budget.MaxLineBytes {
 				result.Errors = append(result.Errors, recoverableError("line_limit_exceeded", "line byte limit exceeded", span.line))
+			}
+			if discardPayload {
+				if strings.TrimRight(span.text, "\r\n") == "@payload end" {
+					discardPayload = false
+				}
+				continue
 			}
 			if activePayload != nil {
 				if strings.TrimRight(span.text, "\r\n") == "@payload end" {
@@ -131,6 +138,17 @@ func (p Parser) Parse(r io.Reader) (*ParseResult, error) {
 			}
 			if result.Result != nil {
 				result.Errors = append(result.Errors, recoverableError("content_after_result", "stream continued after @result", span.line))
+			}
+			if !controlAllowedForRole(p.Role, tag) {
+				result.Normalizations = append(result.Normalizations, Normalization{
+					Code:    "ignored_disallowed_control",
+					Message: fmt.Sprintf("ignored @%s because role %q cannot emit it", tag, p.Role),
+					Line:    span.line,
+				})
+				if tag == "payload" && strings.HasPrefix(strings.TrimSpace(payload), "begin") {
+					discardPayload = true
+				}
+				continue
 			}
 
 			switch tag {
@@ -247,10 +265,30 @@ func (p Parser) Parse(r io.Reader) (*ParseResult, error) {
 				result.Commands = append(result.Commands, CommandProposal{FrameID: frame.ID, Repo: fields["repo"], Command: command})
 			case "result":
 				fields, ok := parseFields(payload)
-				if !ok || fields["status"] == "" || fields["artifact"] == "" {
-					result.Errors = append(result.Errors, recoverableError("malformed_known_tag", "malformed @result control line", span.line))
+				if !ok {
+					result.Errors = append(result.Errors, recoverableError("malformed_result", "@result fields are malformed", span.line))
 					appendContent(activeReport, span.text, &totalReportBytes)
 					continue
+				}
+				result.ResultCandidate = cloneFields(fields)
+				if fields["status"] == "" {
+					result.Errors = append(result.Errors, recoverableError("missing_result_status", "@result is missing required field status", span.line))
+					appendContent(activeReport, span.text, &totalReportBytes)
+					continue
+				}
+				if fields["artifact"] == "" {
+					reportPath, err := artifact.RoleReportPath(p.Role)
+					if err != nil || reports[reportPath] == nil {
+						result.Errors = append(result.Errors, recoverableError("missing_result_artifact", "@result is missing required field artifact", span.line))
+						appendContent(activeReport, span.text, &totalReportBytes)
+						continue
+					}
+					fields["artifact"] = reportPath
+					result.Normalizations = append(result.Normalizations, Normalization{
+						Code:    "inferred_result_artifact",
+						Message: fmt.Sprintf("inferred canonical artifact %q for role %q", reportPath, p.Role),
+						Line:    span.line,
+					})
 				}
 				if result.Result != nil {
 					result.Errors = append(result.Errors, recoverableError("multiple_results", "multiple @result lines", span.line))
@@ -327,7 +365,7 @@ func (p Parser) Parse(r io.Reader) (*ParseResult, error) {
 			result.Errors = append(result.Errors, recoverableError("missing_edit_content", "patch edit is missing content artifact", 0))
 		}
 	}
-	result.Repair = buildRepairPacket(result, p.Budget)
+	result.Repair = buildRepairPacket(result, p.Budget, p.Role)
 	return result, nil
 }
 
@@ -409,6 +447,9 @@ func inlineControlIndex(text string) int {
 		if index <= 0 {
 			continue
 		}
+		if !inlineControlBoundary(text[index-1]) {
+			continue
+		}
 		if !inlineControlLooksValid(text[index:]) {
 			continue
 		}
@@ -417,6 +458,15 @@ func inlineControlIndex(text string) int {
 		}
 	}
 	return best
+}
+
+func inlineControlBoundary(previous byte) bool {
+	switch previous {
+	case '.', '!', '?', ':', ';', ')', ']', '}':
+		return true
+	default:
+		return false
+	}
 }
 
 func inlineControlLooksValid(text string) bool {
@@ -443,13 +493,21 @@ func inlineControlLooksValid(text string) bool {
 		return ok
 	case "result":
 		fields, ok := parseFields(payload)
-		return ok && fields["status"] != "" && fields["artifact"] != ""
+		return ok && fields["status"] != ""
 	case "err":
 		fields, ok := parseFields(payload)
 		return ok && fields["code"] != "" && fields["severity"] != ""
 	default:
 		return false
 	}
+}
+
+func cloneFields(fields map[string]string) map[string]string {
+	cloned := make(map[string]string, len(fields))
+	for key, value := range fields {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func splitControl(line string) (tag, payload string, known bool) {
@@ -611,6 +669,19 @@ func statusAllowed(role, status string) bool {
 		"compactor":   {"ready", "blocked", "failed"},
 	}
 	return slices.Contains(allowed[role], status)
+}
+
+func controlAllowedForRole(role, tag string) bool {
+	switch tag {
+	case "say", "report", "ref", "result", "err":
+		return true
+	case "payload", "edit":
+		return role == "implementer"
+	case "cmd":
+		return role == "implementer" || role == "reviewer"
+	default:
+		return false
+	}
 }
 
 func recoverableError(code, message string, line int) ParserError {

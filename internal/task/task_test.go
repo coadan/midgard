@@ -2,14 +2,62 @@ package task
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"midgard/internal/gitrepo"
+	"midgard/internal/lease"
+	"midgard/internal/model"
+	"midgard/internal/model/providers/fake"
+	"midgard/internal/state"
 	"midgard/internal/workbench"
 )
+
+func TestExpiredTaskOwnerIsFencedAfterReclaim(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "lease-fence-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_fenced_owner", Objective: "test fenced reclaim"}); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := AcquireExecutionWithOptions(ctx, root, "task_fenced_owner", lease.Options{
+		OwnerID: "stale-owner", TTL: 40 * time.Millisecond, RenewInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	current, err := AcquireExecution(ctx, root, "task_fenced_owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := fake.New(fake.Response{Text: "@report plan.mdx\n# Plan\n\nReady.\n@result status:ready artifact:plan.mdx checks:none\n"})
+	if _, err := RunRole(stale.Context, root, "task_fenced_owner", model.RolePlanner, RunnerOptions{
+		ModelID: "fake-model", Providers: RoleProviders{model.RolePlanner: provider},
+	}); !errors.Is(err, state.ErrExecutionLeaseLost) {
+		t.Fatalf("stale owner role error = %v", err)
+	}
+	if provider.Calls() != 0 {
+		t.Fatalf("stale owner provider calls = %d, want 0", provider.Calls())
+	}
+	if err := current.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.Close(); !errors.Is(err, state.ErrExecutionLeaseLost) {
+		t.Fatalf("stale close error = %v", err)
+	}
+}
 
 func TestCreateTaskOwnsWorktree(t *testing.T) {
 	ctx := context.Background()
@@ -66,6 +114,110 @@ func TestCreateTaskOwnsWorktree(t *testing.T) {
 	}
 	if diff != "" {
 		t.Fatalf("new task diff = %q, want empty", diff)
+	}
+}
+
+func TestContextPacketIncludesForgeDigest(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "task-forge-context-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := Create(ctx, root, CreateOptions{ID: "task_forge_context", Objective: "respect linked PR state"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout := workbench.NewLayout(root)
+	db, err := state.Open(ctx, layout.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.UpsertForgeAccount(ctx, state.ForgeAccount{ID: "github-main", Kind: "github", BaseURL: "https://github.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertForgeRepo(ctx, state.ForgeRepo{RepoID: "repo1", ForgeID: "github-main", Owner: "example", Name: "project", URL: "https://github.com/example/project"}); err != nil {
+		t.Fatal(err)
+	}
+	link := state.TaskPRLink{
+		ID:      "task_forge_context_repo1_github-main_9",
+		TaskID:  "task_forge_context",
+		RepoID:  "repo1",
+		ForgeID: "github-main",
+		Number:  9,
+		URL:     "https://github.com/example/project/pull/9",
+		HeadSHA: created.Worktrees[0].StartCommit,
+		Source:  "test",
+	}
+	if err := db.UpsertTaskPRLink(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertForgePRSnapshot(ctx, state.ForgePRSnapshot{
+		ID:                    "snap_1",
+		LinkID:                link.ID,
+		FetchedAt:             time.Now().UTC().Format(time.RFC3339Nano),
+		State:                 "open",
+		CheckConclusion:       "success",
+		ReviewDecision:        "approved",
+		UnresolvedThreadCount: 0,
+		ReviewThreadsComplete: true,
+		ArtifactRef:           "artifact:forge/snap.json",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	status, err := Status(ctx, root, "task_forge_context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := contextPacket(ctx, status, layout)
+	if !strings.Contains(packet, "forge_prs:\nrepo:repo1 pr:github-main#9") ||
+		!strings.Contains(packet, "state:open checks:success review:approved threads:0") ||
+		!strings.Contains(packet, "warnings:pr-open") ||
+		!strings.Contains(packet, "refs:forge:artifact:forge/snap.json") {
+		t.Fatalf("context packet missing forge digest:\n%s", packet)
+	}
+	config, err := workbench.ReadConfig(layout.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Forge = workbench.ForgeConfig{ReadinessGates: true, MaxSnapshotAge: "1h"}
+	if err := workbench.WriteConfig(layout.Config, config); err != nil {
+		t.Fatal(err)
+	}
+	gated, err := Status(ctx, root, "task_forge_context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gated.ForgeGates || gated.ForgeReady || gated.NextAction != "resolve-forge-blockers" ||
+		!slices.Contains(gated.ForgeBlockers, "github-main#9:pr-open") {
+		t.Fatalf("gated task status = %#v", gated)
+	}
+}
+
+func TestAcquireExecutionRejectsConcurrentTaskOwner(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if _, err := workbench.Init(root, workbench.InitOptions{Name: "lease-resume-test"}); err != nil {
+		t.Fatal(err)
+	}
+	repo := initLifecycleRepo(t)
+	if _, err := workbench.AddRepo(root, workbench.AddRepoOptions{ID: "repo1", Path: repo, MainRef: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(ctx, root, CreateOptions{ID: "task_lease_resume", Objective: "test lease recovery"}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := AcquireExecution(ctx, root, "task_lease_resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := AcquireExecution(ctx, root, "task_lease_resume"); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("concurrent task execution error = %v", err)
 	}
 }
 

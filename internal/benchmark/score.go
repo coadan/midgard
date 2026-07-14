@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,7 +41,31 @@ type Evidence struct {
 	PlanPath              string
 	ReportPath            string
 	ReviewPath            string
+	RunError              string
+	RunErrorClass         string
+	AcceptanceRequired    bool
+	AcceptanceValid       bool
+	AcceptancePassed      bool
+	AcceptanceStatus      string
+	AcceptanceReason      string
+	AcceptancePath        string
+	AcceptanceChecksum    string
+	AcceptanceChecks      []AcceptanceCheckScore
 	ProviderModels        []ProviderModelEvidence
+}
+
+type AcceptanceCheckScore struct {
+	ID               string
+	RepoID           string
+	Status           string
+	ExpectedExitCode int
+	ExitCode         int
+	TimedOut         bool
+	StdoutTruncated  bool
+	StderrTruncated  bool
+	ResultPath       string
+	StdoutPath       string
+	StderrPath       string
 }
 
 type ProviderModelEvidence struct {
@@ -86,6 +111,14 @@ func ScoreItem(ctx context.Context, root string, item Item) (ItemResult, error) 
 	referenceChecked, referenceMatched := referencePatchMatch(artifactRoot, item)
 	expectedChecked, expectedMatched, touchedFiles := expectedTouchedFilesMatch(patchText, item.ExpectedTouchedFiles)
 	costUSD, costCaveats := costEvidence(costRollups)
+	acceptance, err := verifyAcceptanceEvidence(ctx, db, artifactRoot, item)
+	if err != nil {
+		return ItemResult{}, err
+	}
+	runError, err := latestBenchmarkItemError(ctx, db, item)
+	if err != nil {
+		return ItemResult{}, err
+	}
 	evidence := Evidence{
 		TaskID:                item.TaskID,
 		TaskState:             status.Task.State,
@@ -102,10 +135,39 @@ func ScoreItem(ctx context.Context, root string, item Item) (ItemResult, error) 
 		PlanPath:              existingArtifact(artifactRoot, "plan.mdx"),
 		ReportPath:            existingArtifact(artifactRoot, "implementation.mdx"),
 		ReviewPath:            existingArtifact(artifactRoot, "review.mdx"),
+		RunError:              runError.Message,
+		RunErrorClass:         runError.Class,
+		AcceptanceRequired:    acceptance.Required,
+		AcceptanceValid:       acceptance.Valid,
+		AcceptancePassed:      acceptance.Passed,
+		AcceptanceStatus:      acceptance.Status,
+		AcceptanceReason:      acceptance.Reason,
+		AcceptancePath:        acceptance.Path,
+		AcceptanceChecksum:    acceptance.Checksum,
+		AcceptanceChecks:      acceptance.Checks,
 		ProviderModels:        usageEvidence(usageRecords),
 	}
+	baseComplete := status.Task.State == "completed" && evidence.PatchPath != "" && evidence.PatchBytes > 0 && evidence.ReviewPath != ""
+	if evidence.AcceptanceRequired {
+		switch {
+		case !baseComplete && evidence.PatchPath != "" && evidence.PatchBytes > 0:
+			return ItemResult{ItemID: item.ID, Score: ScorePartial, Evidence: evidence}, nil
+		case !baseComplete:
+			return ItemResult{ItemID: item.ID, Score: ScoreFail, Evidence: evidence}, nil
+		case !evidence.AcceptanceValid:
+			return ItemResult{ItemID: item.ID, Score: ScoreInvalid, Evidence: evidence}, nil
+		case !evidence.AcceptancePassed:
+			return ItemResult{ItemID: item.ID, Score: ScoreFail, Evidence: evidence}, nil
+		default:
+			score := ScorePass
+			if evidence.ExpectedFilesChecked && !evidence.ExpectedFilesMatched {
+				score = ScorePartial
+			}
+			return ItemResult{ItemID: item.ID, Score: score, Evidence: evidence}, nil
+		}
+	}
 	score := ScoreFail
-	if status.Task.State == "completed" && evidence.PatchPath != "" && evidence.PatchBytes > 0 && evidence.ReviewPath != "" {
+	if baseComplete {
 		if !evidence.ReferencePatchChecked || evidence.ReferencePatchMatched {
 			score = ScorePass
 		} else {
@@ -118,6 +180,42 @@ func ScoreItem(ctx context.Context, root string, item Item) (ItemResult, error) 
 		score = ScorePartial
 	}
 	return ItemResult{ItemID: item.ID, Score: score, Evidence: evidence}, nil
+}
+
+type benchmarkItemError struct {
+	Message string
+	Class   string
+}
+
+func latestBenchmarkItemError(ctx context.Context, db *state.DB, item Item) (benchmarkItemError, error) {
+	events, err := db.EventsForTask(ctx, item.TaskID)
+	if err != nil {
+		return benchmarkItemError{}, err
+	}
+	var latest benchmarkItemError
+	for _, event := range events {
+		if event.Type == "benchmark.item.error_cleared" {
+			var payload struct {
+				ItemID string `json:"item_id"`
+			}
+			if json.Unmarshal([]byte(event.Payload), &payload) == nil && payload.ItemID == item.ID {
+				latest = benchmarkItemError{}
+			}
+			continue
+		}
+		if event.Type != "benchmark.item.error" {
+			continue
+		}
+		var payload struct {
+			ItemID     string `json:"item_id"`
+			Error      string `json:"error"`
+			ErrorClass string `json:"error_class"`
+		}
+		if json.Unmarshal([]byte(event.Payload), &payload) == nil && payload.ItemID == item.ID {
+			latest = benchmarkItemError{Message: payload.Error, Class: payload.ErrorClass}
+		}
+	}
+	return latest, nil
 }
 
 func referencePatchMatch(artifactRoot string, item Item) (bool, bool) {

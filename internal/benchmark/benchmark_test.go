@@ -26,13 +26,25 @@ func TestWorkerContextOmitsHiddenReferencePRs(t *testing.T) {
 	if len(manifest.Items[0].HiddenReferencePRs) == 0 {
 		t.Fatal("fixture missing hidden reference PR")
 	}
+	manifest.Items[0].AcceptanceChecks = []AcceptanceCheck{
+		{ID: "visible", Command: "go test ./..."},
+		{ID: "hidden", Command: "go test ./internal/secret", Hidden: true},
+	}
 	worker := WorkerContext(manifest.Items[0])
+	if len(worker.Checks) != 2 || worker.Checks[0].ID != "visible" || worker.Checks[1].ID != "check-3" {
+		t.Fatalf("worker checks = %#v", worker.Checks)
+	}
 	data, err := json.Marshal(worker)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "pull/42") || strings.Contains(string(data), "abc123") {
+	if strings.Contains(string(data), "pull/42") || strings.Contains(string(data), "abc123") ||
+		strings.Contains(string(data), "internal/secret") || !strings.Contains(string(data), "go test ./...") {
 		t.Fatalf("worker context leaked hidden reference data: %s", data)
+	}
+	external := benchmarkExternalContext(manifest.Items[0])
+	if !strings.Contains(external, "Valid ids: visible,check-3") || !strings.Contains(external, "Never place shell command text") {
+		t.Fatalf("external benchmark context = %s", external)
 	}
 }
 
@@ -305,6 +317,7 @@ func TestRunSuitePreparesMergedPRBenchmark(t *testing.T) {
 			Objective:            "Apply the README wording change from the merged PR.",
 			TaskID:               "task_oss_readme_pr",
 			RepoIDs:              []string{"repo1"},
+			Checks:               []string{"git diff --check"},
 			ExpectedTouchedFiles: []string{"README.md"},
 			HiddenReferencePatch: referencePath,
 			HiddenReferencePRs: []ReferencePR{{
@@ -348,6 +361,8 @@ func TestRunSuitePreparesMergedPRBenchmark(t *testing.T) {
 	if score.Score != ScorePass ||
 		!score.Evidence.ReferencePatchMatched ||
 		!score.Evidence.ExpectedFilesMatched ||
+		!score.Evidence.AcceptanceValid ||
+		!score.Evidence.AcceptancePassed ||
 		score.Evidence.CostUSD <= 0 {
 		t.Fatalf("score = %#v", score)
 	}
@@ -356,7 +371,7 @@ func TestRunSuitePreparesMergedPRBenchmark(t *testing.T) {
 		t.Fatal(err)
 	}
 	reportText := string(reportData)
-	for _, want := range []string{"score: pass", "reference_patch_match: true", "expected_touched_files_match: true", "cost_usd:"} {
+	for _, want := range []string{"score: pass", "reference_patch_match: true", "expected_touched_files_match: true", "acceptance: status:passed valid:true passed:true", "cost_usd:"} {
 		if !strings.Contains(reportText, want) {
 			t.Fatalf("report missing %q:\n%s", want, reportText)
 		}
@@ -390,6 +405,78 @@ func TestRunSuitePreparesMergedPRBenchmark(t *testing.T) {
 	}
 }
 
+func TestRunSuiteRecordsItemFailureAndContinues(t *testing.T) {
+	ctx := context.Background()
+	sourceRepo := initBenchmarkRepo(t)
+	baseCommit, err := gitrepo.CurrentCommit(ctx, sourceRepo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	manifest := Manifest{
+		ID:    "fault-isolated-suite",
+		Repos: []RepoSource{{ID: "repo1", Path: sourceRepo, CheckoutRef: baseCommit}},
+		Items: []Item{
+			{ID: "provider-error", TaskID: "task_provider_error", Objective: "exercise a provider failure", RepoIDs: []string{"repo1"}, Checks: []string{"git diff --check"}},
+			{ID: "successful-item", TaskID: "task_after_error", Objective: "change README heading to recovered", RepoIDs: []string{"repo1"}, Checks: []string{"git diff --check"}, ExpectedTouchedFiles: []string{"README.md"}},
+		},
+	}
+	result, err := RunSuite(ctx, root, manifest, SuiteOptions{
+		ProviderFactory: func(item Item) (midgardtask.RoleProviders, string, cost.Pricing, error) {
+			if item.ID == "provider-error" {
+				bad := fake.Response{Text: "not a Midgard stream", Usage: model.Usage{InputTokens: 10, OutputTokens: 5}}
+				return midgardtask.RoleProviders{
+					model.RolePlanner: fake.New(bad, bad, bad), model.RoleImplementer: fake.New(), model.RoleReviewer: fake.New(),
+				}, "fake-model", cost.Pricing{ID: "test", InputUSDPerMillion: 1, OutputUSDPerMillion: 1}, nil
+			}
+			implementation := strings.Join([]string{
+				"@report implementation.mdx",
+				"# Implementation",
+				"@payload begin type:patch path:patches/readme.diff",
+				"--- a/README.md",
+				"+++ b/README.md",
+				"@@ -1 +1 @@",
+				"-# benchmark fixture",
+				"+# recovered",
+				"@payload end",
+				"@edit file:README.md action:modify mode:patch content:artifact:patches/readme.diff reason:recover repo:repo1",
+				"@result status:ready artifact:implementation.mdx checks:none",
+				"",
+			}, "\n")
+			return midgardtask.RoleProviders{
+				model.RolePlanner:     fake.New(fake.Response{Text: "@report plan.mdx\n# Plan\n\nReady.\n@result status:ready artifact:plan.mdx checks:none\n"}),
+				model.RoleImplementer: fake.New(fake.Response{Text: implementation}),
+				model.RoleReviewer:    fake.New(fake.Response{Text: "@report review.mdx\n# Review\n\nApproved.\n@result status:approved artifact:review.mdx findings:none\n"}),
+			}, "fake-model", cost.Pricing{}, nil
+		},
+		ResetTasks: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.TaskRuns) != 2 || result.TaskRuns[0].State != "error" || result.TaskRuns[0].Error == "" || result.TaskRuns[0].ErrorClass != "protocol" || result.TaskRuns[0].CostUSD <= 0 || result.TaskRuns[1].State != "completed" {
+		t.Fatalf("task runs = %#v", result.TaskRuns)
+	}
+	if len(result.Report.Results) != 2 || result.Report.Results[0].Score != ScoreFail || result.Report.Results[0].Evidence.RunError == "" ||
+		result.Report.Results[0].Evidence.RunErrorClass != "protocol" || result.Report.Results[0].Evidence.CostUSD <= 0 || len(result.Report.Results[0].Evidence.ProviderModels) == 0 || result.Report.Results[1].Score != ScorePass {
+		t.Fatalf("suite results = %#v", result.Report.Results)
+	}
+	regenerated, err := Run(ctx, root, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regenerated.Results[0].Evidence.RunError == "" || regenerated.Results[0].Evidence.RunErrorClass != "protocol" {
+		t.Fatal("regenerated report lost durable item error")
+	}
+	reportData, err := os.ReadFile(result.Report.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(reportData), "run_error_class: protocol") {
+		t.Fatalf("report missing protocol failure class:\n%s", reportData)
+	}
+}
+
 func TestImportPRWritesManifestAndReferencePatch(t *testing.T) {
 	ctx := context.Background()
 	sourceRepo := initBenchmarkRepo(t)
@@ -410,10 +497,18 @@ func TestImportPRWritesManifestAndReferencePatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	referenceDiff, err := gitrepo.Run(ctx, sourceRepo, "diff", baseCommit+".."+mergedCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/example/project/pulls/123":
+			if r.Header.Get("Accept") == "application/vnd.github.diff" {
+				_, _ = w.Write([]byte(referenceDiff + "\n"))
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number":           123,
 				"title":            "Update benchmark README",
@@ -446,6 +541,7 @@ func TestImportPRWritesManifestAndReferencePatch(t *testing.T) {
 		OutPath:    outPath,
 		CloneURL:   sourceRepo,
 		APIBaseURL: server.URL,
+		Checks:     []AcceptanceCheck{{ID: "unit", RepoID: "repo1", Command: "go test ./..."}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -474,6 +570,9 @@ func TestImportPRWritesManifestAndReferencePatch(t *testing.T) {
 	}
 	if len(item.ExpectedTouchedFiles) != 1 || item.ExpectedTouchedFiles[0] != "README.md" {
 		t.Fatalf("expected files = %#v", item.ExpectedTouchedFiles)
+	}
+	if len(item.AcceptanceChecks) != 1 || item.AcceptanceChecks[0].ID != "unit" || item.AcceptanceChecks[0].Command != "go test ./..." {
+		t.Fatalf("acceptance checks = %#v", item.AcceptanceChecks)
 	}
 	if len(item.HiddenReferencePRs) != 1 ||
 		item.HiddenReferencePRs[0].Repo != "example/project" ||

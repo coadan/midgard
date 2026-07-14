@@ -2,6 +2,8 @@ package model_test
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +13,35 @@ import (
 	"midgard/internal/model/providers/fake"
 	"midgard/internal/stream"
 )
+
+func TestRunnerFenceStopsStreamArtifactPersistence(t *testing.T) {
+	packet, err := model.BuildPacket(model.PacketInput{
+		TaskID: "task_fenced", Role: model.RolePlanner, ModelID: "fake-model", Context: "task context", Budget: stream.DefaultBudget(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactDir := filepath.Join(t.TempDir(), "artifacts")
+	fenceLost := errors.New("fence lost")
+	checks := 0
+	_, err = model.Runner{
+		Provider: fake.New(fake.Response{Text: "@report plan.mdx\n# Plan\n\nReady.\n@result status:ready artifact:plan.mdx checks:none\n"}),
+		Store:    artifact.NewStore(artifactDir), Budget: stream.DefaultBudget(),
+		Fence: func(context.Context) error {
+			checks++
+			if checks > 1 {
+				return fenceLost
+			}
+			return nil
+		},
+	}.Run(context.Background(), packet)
+	if !errors.Is(err, fenceLost) {
+		t.Fatalf("runner error = %v, want fence loss", err)
+	}
+	if _, err := os.Stat(filepath.Join(artifactDir, "plan.mdx")); !os.IsNotExist(err) {
+		t.Fatalf("stale plan artifact stat error = %v", err)
+	}
+}
 
 func TestFakeProviderCompletesCoreRoles(t *testing.T) {
 	cases := []struct {
@@ -84,6 +115,54 @@ func TestRepairPacketUsesRoleReportPath(t *testing.T) {
 	}
 }
 
+func TestRunnerRepairReusesSealedPayloadFromPreviousTurn(t *testing.T) {
+	packet, err := model.BuildPacket(model.PacketInput{
+		TaskID: "task_reuse", Role: model.RoleImplementer, ModelID: "fake-model", Context: "task context", Budget: stream.DefaultBudget(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := strings.Join([]string{
+		"@report implementation.mdx",
+		"@payload begin type:patch path:patches/reuse.diff",
+		"--- a/README.md",
+		"+++ b/README.md",
+		"@@ -1 +1 @@",
+		"-old",
+		"+new",
+		"@payload end",
+		"@edit file:README.md action:modify mode:patch content:artifact:patches/reuse.diff reason:test repo:repo1",
+		"",
+	}, "\n")
+	second := "@result status:ready artifact:implementation.mdx checks:none\n"
+	result, err := model.Runner{
+		Provider: fake.New(fake.Response{Text: first}, fake.Response{Text: second}),
+		Store:    artifact.NewStore(filepath.Join(t.TempDir(), "artifacts")),
+		Budget:   stream.DefaultBudget(),
+	}.Run(context.Background(), packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Attempts != 2 || result.Parsed == nil || result.Parsed.Result == nil {
+		t.Fatalf("run = %#v", result)
+	}
+	found := false
+	for _, rec := range result.Parsed.Artifacts {
+		if rec.Path == "patches/reuse.diff" && rec.Type == artifact.TypePayload && rec.State == artifact.StateSealed {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("reused payload missing from final artifacts: %#v", result.Parsed.Artifacts)
+	}
+	if len(result.Parsed.Edits) != 1 || result.Parsed.Edits[0].Content != "artifact:patches/reuse.diff" {
+		t.Fatalf("preserved edits = %#v", result.Parsed.Edits)
+	}
+	if len(result.Parsed.Normalizations) != 1 || result.Parsed.Normalizations[0].Code != "preserved_result_repair_state" {
+		t.Fatalf("normalizations = %#v", result.Parsed.Normalizations)
+	}
+}
+
 func TestSourceEditRepairPacketReferencesDiagnostics(t *testing.T) {
 	packet, err := model.BuildPacket(model.PacketInput{
 		TaskID:  "task_1",
@@ -133,11 +212,12 @@ func TestRunnerRepairsMissingResult(t *testing.T) {
 	}
 	provider := fake.New(
 		fake.Response{Text: "@report plan.mdx\n# Plan\n\nMissing result.\n", Usage: model.Usage{InputTokens: 10, OutputTokens: 5}},
-		fake.Response{Text: "@report plan.mdx\n# Plan\n\nRepaired.\n@result status:ready artifact:plan.mdx checks:none\n", Usage: model.Usage{InputTokens: 4, OutputTokens: 3}},
+		fake.Response{Text: "@result status:ready artifact:plan.mdx checks:none\n", Usage: model.Usage{InputTokens: 4, OutputTokens: 3}},
 	)
+	store := artifact.NewStore(filepath.Join(t.TempDir(), "artifacts"))
 	result, err := model.Runner{
 		Provider:   provider,
-		Store:      artifact.NewStore(filepath.Join(t.TempDir(), "artifacts")),
+		Store:      store,
 		Budget:     stream.DefaultBudget(),
 		MaxRepairs: 1,
 	}.Run(context.Background(), packet)
@@ -152,6 +232,63 @@ func TestRunnerRepairsMissingResult(t *testing.T) {
 	}
 	if !result.Packet.Repair {
 		t.Fatal("final packet should be repair packet")
+	}
+	if len(result.Parsed.Normalizations) != 1 || result.Parsed.Normalizations[0].Code != "preserved_result_repair_state" {
+		t.Fatalf("normalizations = %#v", result.Parsed.Normalizations)
+	}
+	report, err := store.Read("plan.mdx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "Missing result.") {
+		t.Fatalf("preserved report = %q", report)
+	}
+	packets := provider.Packets()
+	if len(packets) != 2 ||
+		!strings.Contains(packets[1].RepairInstructions, "Emit exactly one corrected @result line") ||
+		!strings.Contains(packets[1].RepairInstructions, "code:missing_result") ||
+		!strings.Contains(packets[1].RepairInstructions, "remaining_repair_attempts:1") {
+		t.Fatalf("result-only repair packet = %#v", packets)
+	}
+}
+
+func TestRunnerNormalizesObservedPlannerResultWithoutRepair(t *testing.T) {
+	packet, err := model.BuildPacket(model.PacketInput{
+		TaskID: "task_localdate", Role: model.RolePlanner, ModelID: "fake-model", Context: "task context", Budget: stream.DefaultBudget(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := strings.Join([]string{
+		"@report plan.mdx",
+		"",
+		"## Plan: Fix duplicated article in LocalDate comment",
+		"",
+		"Update `unstable/kind.go` and run `go test ./...`.",
+		"",
+		"@result status:ready checks:go-test",
+		"",
+	}, "\n")
+	provider := fake.New(
+		fake.Response{Text: observed},
+		fake.Response{Text: "this response must not be requested"},
+	)
+	result, err := model.Runner{
+		Provider: provider,
+		Store:    artifact.NewStore(filepath.Join(t.TempDir(), "artifacts")),
+		Budget:   stream.DefaultBudget(),
+	}.Run(context.Background(), packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.Calls() != 1 || result.Attempts != 1 {
+		t.Fatalf("provider calls=%d attempts=%d, want 1", provider.Calls(), result.Attempts)
+	}
+	if result.Parsed.Result == nil || result.Parsed.Result.Artifact != "plan.mdx" {
+		t.Fatalf("result = %#v", result.Parsed.Result)
+	}
+	if len(result.Parsed.Normalizations) != 1 || result.Parsed.Normalizations[0].Code != "inferred_result_artifact" {
+		t.Fatalf("normalizations = %#v", result.Parsed.Normalizations)
 	}
 }
 
@@ -349,6 +486,59 @@ func TestRunnerContinuesBlockedImplementerCommandTurn(t *testing.T) {
 	}
 	if result.Parsed.Result == nil || result.Parsed.Result.Status != "no-op" {
 		t.Fatalf("parsed result = %#v", result.Parsed.Result)
+	}
+}
+
+func TestRunnerContinuesReviewerCommandTurn(t *testing.T) {
+	packet, err := model.BuildPacket(model.PacketInput{
+		TaskID:  "task_1",
+		Role:    model.RoleReviewer,
+		ModelID: "fake-model",
+		Context: "task context",
+		Budget:  stream.DefaultBudget(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(packet.System, "You may inspect like any other role") ||
+		!strings.Contains(packet.System, "Do not use reviewer @cmd to mutate source files") {
+		t.Fatalf("reviewer system prompt missing command exploration guidance:\n%s", packet.System)
+	}
+	provider := fake.New(
+		fake.Response{Text: "@report review.mdx\nNeed diff context.\n@cmd repo:repo1 -- git diff -- README.md\n@result status:blocked artifact:review.mdx findings:none\n", Usage: model.Usage{}},
+		fake.Response{Text: "@report review.mdx\n- P1 extra-heading path:README.md evidence: diff keeps the wrong heading. impact: objective not satisfied. fix: remove it.\n@result status:changes-requested artifact:review.mdx findings:extra-heading\n", Usage: model.Usage{}},
+	)
+	var commandCalls int
+	result, err := model.Runner{
+		Provider: provider,
+		Store:    artifact.NewStore(filepath.Join(t.TempDir(), "artifacts")),
+		Budget:   stream.DefaultBudget(),
+		CommandHandler: func(ctx context.Context, commands []stream.CommandProposal) (string, error) {
+			commandCalls++
+			if len(commands) != 1 || commands[0].Repo != "repo1" || commands[0].Command != "git diff -- README.md" {
+				t.Fatalf("commands = %#v", commands)
+			}
+			return "command id:cmd_1 repo:repo1 exit:0\nstdout_preview:\ndiff --git a/README.md b/README.md\n+# wrong\n", nil
+		},
+	}.Run(context.Background(), packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commandCalls != 1 {
+		t.Fatalf("command calls = %d, want 1", commandCalls)
+	}
+	if result.Attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", result.Attempts)
+	}
+	if result.Parsed.Result == nil || result.Parsed.Result.Status != "changes-requested" {
+		t.Fatalf("parsed result = %#v", result.Parsed.Result)
+	}
+	packets := provider.Packets()
+	if len(packets) != 2 ||
+		!strings.Contains(packets[1].UserContent(), "Continue the same reviewer role") ||
+		!strings.Contains(packets[1].UserContent(), "stdout_preview") ||
+		!strings.Contains(packets[1].UserContent(), "Do not emit @payload or @edit") {
+		t.Fatalf("reviewer continuation packet missing context:\n%v", packets)
 	}
 }
 

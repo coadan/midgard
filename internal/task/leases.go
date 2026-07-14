@@ -2,29 +2,70 @@ package task
 
 import (
 	"context"
-	"fmt"
-	"time"
+	"errors"
 
-	"midgard/internal/model"
+	"midgard/internal/lease"
 	"midgard/internal/state"
+	"midgard/internal/workbench"
 )
 
-type Lease struct {
-	ID     string
-	TaskID string
-	Role   model.Role
-	State  string
+type Execution struct {
+	Context context.Context
+	db      *state.DB
+	scope   *lease.Scope
 }
 
-func grantLease(ctx context.Context, db *state.DB, taskID string, role model.Role) (Lease, error) {
-	lease := Lease{
-		ID:     fmt.Sprintf("lease_%s_%s_%d", taskID, role, time.Now().UTC().UnixNano()),
-		TaskID: taskID,
-		Role:   role,
-		State:  "active",
+func AcquireExecution(ctx context.Context, root, taskID string) (*Execution, error) {
+	return AcquireExecutionWithOptions(ctx, root, taskID, lease.Options{})
+}
+
+func AcquireExecutionWithOptions(ctx context.Context, root, taskID string, opts lease.Options) (*Execution, error) {
+	if err := lease.Check(ctx); err != nil {
+		return nil, err
 	}
-	if err := db.InsertLease(ctx, lease.ID, lease.TaskID, lease.Role.String(), lease.State); err != nil {
-		return Lease{}, err
+	status, err := workbench.Status(root)
+	if err != nil {
+		return nil, err
 	}
-	return lease, nil
+	db, err := state.Open(ctx, workbench.NewLayout(status.Root).State)
+	if err != nil {
+		return nil, err
+	}
+	execution, err := acquireExecutionWithDBAndOptions(ctx, db, taskID, opts)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	execution.db = db
+	return execution, nil
+}
+
+func acquireExecutionWithDB(ctx context.Context, db *state.DB, taskID string) (*Execution, error) {
+	return acquireExecutionWithDBAndOptions(ctx, db, taskID, lease.Options{})
+}
+
+func acquireExecutionWithDBAndOptions(ctx context.Context, db *state.DB, taskID string, opts lease.Options) (*Execution, error) {
+	scope, err := lease.Ensure(ctx, db, state.LeaseResourceTask, taskID, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Execution{Context: scope.Context, scope: scope}, nil
+}
+
+func (e *Execution) Close() error {
+	if e == nil {
+		return nil
+	}
+	var err error
+	if e.scope != nil {
+		err = e.scope.Close()
+	}
+	if e.db != nil {
+		err = errors.Join(err, e.db.Close())
+	}
+	return err
+}
+
+func CheckExecution(ctx context.Context) error {
+	return lease.Check(ctx)
 }

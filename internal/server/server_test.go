@@ -14,6 +14,7 @@ import (
 
 	"midgard/internal/command"
 	"midgard/internal/gitrepo"
+	midgardtask "midgard/internal/task"
 	"midgard/internal/workbench"
 )
 
@@ -58,6 +59,22 @@ func TestServerTaskCommandArtifactsAndSSE(t *testing.T) {
 	}
 	if statusResp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d body=%s", statusResp.StatusCode, readBody(t, statusResp))
+	}
+
+	execution, err := midgardtask.AcquireExecution(context.Background(), root, "task_api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictResp := postJSON(t, httpServer.URL+"/api/commands/run", map[string]any{
+		"task_id": "task_api",
+		"repo_id": "repo1",
+		"command": "printf stale >> README.md",
+	})
+	if conflictResp.StatusCode != http.StatusConflict || !strings.Contains(readBody(t, conflictResp), "already running") {
+		t.Fatalf("contended command status = %d", conflictResp.StatusCode)
+	}
+	if err := execution.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	commandResp := postJSON(t, httpServer.URL+"/api/commands/run", map[string]any{

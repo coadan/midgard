@@ -98,6 +98,83 @@ func TestMissingResultCreatesRepairPacket(t *testing.T) {
 	}
 }
 
+func TestResultInfersOpenedCanonicalReportArtifact(t *testing.T) {
+	raw := readFixture(t, "planner_missing_result_artifact.stream")
+	store := artifact.NewStore(t.TempDir())
+	result, err := NewParser("planner", store, DefaultBudget()).ParseString(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Repair != nil || len(result.Errors) != 0 {
+		t.Fatalf("unexpected repair/errors: repair=%#v errors=%#v", result.Repair, result.Errors)
+	}
+	if result.Result == nil || result.Result.Artifact != "plan.mdx" || result.Result.Status != "ready" {
+		t.Fatalf("result = %#v", result.Result)
+	}
+	if len(result.Normalizations) != 1 || result.Normalizations[0].Code != "inferred_result_artifact" {
+		t.Fatalf("normalizations = %#v", result.Normalizations)
+	}
+	report := artifactByPath(result.Artifacts, "plan.mdx")
+	if report.State != artifact.StateSealed {
+		t.Fatalf("report state = %s, want sealed", report.State)
+	}
+}
+
+func TestMissingResultArtifactWithoutOpenedReportStillNeedsRepair(t *testing.T) {
+	store := artifact.NewStore(t.TempDir())
+	result, err := NewParser("planner", store, DefaultBudget()).ParseString("@result status:ready checks:none\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Result != nil || result.Repair == nil {
+		t.Fatalf("result=%#v repair=%#v", result.Result, result.Repair)
+	}
+	if !contains(result.Repair.ErrorCodes, "missing_result_artifact") || !contains(result.Repair.ErrorCodes, "missing_result") {
+		t.Fatalf("repair codes = %#v", result.Repair.ErrorCodes)
+	}
+}
+
+func TestPlannerDisallowedToolFramesAreDiscardedWithEvidence(t *testing.T) {
+	raw := readFixture(t, "planner_disallowed_tool_frames.stream")
+	store := artifact.NewStore(t.TempDir())
+	result, err := NewParser("planner", store, DefaultBudget()).ParseString(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Repair != nil || len(result.Errors) != 0 || result.Result == nil {
+		t.Fatalf("result=%#v repair=%#v errors=%#v", result.Result, result.Repair, result.Errors)
+	}
+	if len(result.Artifacts) != 1 || result.Artifacts[0].Path != "plan.mdx" || result.Artifacts[0].State != artifact.StateSealed {
+		t.Fatalf("artifacts = %#v", result.Artifacts)
+	}
+	if len(result.Edits) != 0 || len(result.Commands) != 0 {
+		t.Fatalf("edits=%#v commands=%#v", result.Edits, result.Commands)
+	}
+	if len(result.Normalizations) != 3 {
+		t.Fatalf("normalizations = %#v, want payload/edit/cmd discards", result.Normalizations)
+	}
+	for _, normalization := range result.Normalizations {
+		if normalization.Code != "ignored_disallowed_control" {
+			t.Fatalf("normalization = %#v", normalization)
+		}
+	}
+	if _, err := store.Read("patches/fix-localdate-comment.diff"); !os.IsNotExist(err) {
+		t.Fatalf("discarded payload was stored: %v", err)
+	}
+}
+
+func TestImplementerMalformedCommandStillNeedsRepair(t *testing.T) {
+	store := artifact.NewStore(t.TempDir())
+	raw := "@report implementation.mdx\nInspect and test.\n@cmd go test ./...\n@result status:ready artifact:implementation.mdx checks:none\n"
+	result, err := NewParser("implementer", store, DefaultBudget()).ParseString(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Repair == nil || !contains(result.Repair.ErrorCodes, "malformed_known_tag") {
+		t.Fatalf("repair = %#v", result.Repair)
+	}
+}
+
 func TestInlineResultAfterReportTextIsRecovered(t *testing.T) {
 	raw := "@report implementation.mdx\nInspected files and finished.@result status:failed artifact:implementation.mdx checks:none\n"
 	store := artifact.NewStore(t.TempDir())
@@ -142,6 +219,41 @@ func TestInlineCommandAfterReportTextIsRecovered(t *testing.T) {
 	}
 	if string(data) != "Need inspect." {
 		t.Fatalf("report = %q", data)
+	}
+}
+
+func TestInlineControlMentionInReportTextIsNotParsed(t *testing.T) {
+	raw := strings.Join([]string{
+		"@report plan.mdx",
+		"# Plan",
+		"",
+		"4. Emit @result status:ready artifact:plan.mdx checks:go-test.",
+		"@result status:ready artifact:plan.mdx checks:go-test",
+		"",
+	}, "\n")
+	store := artifact.NewStore(t.TempDir())
+	result, err := NewParser("planner", store, DefaultBudget()).ParseString(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Repair != nil || len(result.Errors) != 0 || result.Result == nil {
+		t.Fatalf("result=%#v repair=%#v errors=%#v", result.Result, result.Repair, result.Errors)
+	}
+	resultFrames := 0
+	for _, frame := range result.Frames {
+		if frame.Type == FrameResult {
+			resultFrames++
+		}
+	}
+	if resultFrames != 1 {
+		t.Fatalf("result frames = %d, want 1: %#v", resultFrames, result.Frames)
+	}
+	report, err := store.Read("plan.mdx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "Emit @result") {
+		t.Fatalf("report lost inline control mention:\n%s", report)
 	}
 }
 
@@ -236,7 +348,7 @@ func TestPayloadPreservesUnifiedDiffHunkHeaders(t *testing.T) {
 
 func TestPatchEditCanUseQuotedReasonAndFollowingPayload(t *testing.T) {
 	stream := strings.Join([]string{
-		"@report plan.mdx",
+		"@report implementation.mdx",
 		"# Plan",
 		"",
 		"@edit file:README.md action:edit mode:patch reason:\"Fix awkward sentence about UnmarshalTOML interface\"",
@@ -247,11 +359,11 @@ func TestPatchEditCanUseQuotedReasonAndFollowingPayload(t *testing.T) {
 		"-old",
 		"+new",
 		"@payload end",
-		"@result status:ready artifact:plan.mdx checks:none",
+		"@result status:ready artifact:implementation.mdx checks:none",
 		"",
 	}, "\n")
 	store := artifact.NewStore(t.TempDir())
-	result, err := NewParser("planner", store, DefaultBudget()).ParseString(stream)
+	result, err := NewParser("implementer", store, DefaultBudget()).ParseString(stream)
 	if err != nil {
 		t.Fatal(err)
 	}

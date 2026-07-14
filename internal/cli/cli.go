@@ -38,6 +38,8 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runArtifact(ctx, args[1:], stdout, stderr)
 	case "benchmark":
 		return runBenchmark(ctx, args[1:], stdout, stderr)
+	case "forge":
+		return runForge(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -111,6 +113,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  task create        create a task worktree")
 	fmt.Fprintln(w, "  task status        show task state")
 	fmt.Fprintln(w, "  task diff          show task diff")
+	fmt.Fprintln(w, "  task pr            inspect task pull requests")
 	fmt.Fprintln(w, "  command run        run an audited command")
 	fmt.Fprintln(w, "  check record       record a check result")
 	fmt.Fprintln(w, "  serve              start local HTTP server")
@@ -120,6 +123,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  benchmark import-pr import a merged GitHub PR benchmark")
 	fmt.Fprintln(w, "  benchmark run      execute benchmark items with --provider")
 	fmt.Fprintln(w, "  benchmark report   regenerate benchmark report")
+	fmt.Fprintln(w, "  forge repo link    link a registered repo to a forge remote")
+	fmt.Fprintln(w, "  forge auth status  show GitHub authentication status")
 }
 
 func printWorkbenchUsage(w io.Writer) {

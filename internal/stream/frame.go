@@ -64,6 +64,12 @@ type ParserError struct {
 	Recoverable bool
 }
 
+type Normalization struct {
+	Code    string
+	Message string
+	Line    int
+}
+
 type ParseResult struct {
 	Raw               string
 	Frames            []Frame
@@ -72,7 +78,9 @@ type ParseResult struct {
 	Edits             []EditIntent
 	Refs              []Ref
 	Errors            []ParserError
+	Normalizations    []Normalization
 	Result            *ResultFrame
+	ResultCandidate   map[string]string
 	Repair            *RepairPacket
 	ProviderMaxTokens int
 }

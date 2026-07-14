@@ -36,7 +36,7 @@ func nullableString(value string) sql.NullString {
 }
 
 func (db *DB) UpsertRepo(ctx context.Context, repo Repo) error {
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := db.fencedExecContext(ctx, `
 INSERT INTO repos (id, workbench_id, path, main_ref)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -57,7 +57,7 @@ WHERE id = ?`, id).Scan(&repo.ID, &repo.WorkbenchID, &repo.Path, &repo.MainRef)
 }
 
 func (db *DB) InsertTask(ctx context.Context, task Task) error {
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := db.fencedExecContext(ctx, `
 INSERT INTO tasks (id, workbench_id, state, objective)
 VALUES (?, ?, ?, ?)`,
 		task.ID, task.WorkbenchID, task.State, task.Objective)
@@ -74,7 +74,7 @@ WHERE id = ?`, id).Scan(&task.ID, &task.WorkbenchID, &task.State, &task.Objectiv
 }
 
 func (db *DB) UpdateTaskState(ctx context.Context, id, taskState string) error {
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := db.fencedExecContext(ctx, `
 UPDATE tasks
 SET state = ?, updated_at = CURRENT_TIMESTAMP
 WHERE id = ?`, taskState, id)
@@ -86,7 +86,18 @@ func (db *DB) DeleteTaskCascade(ctx context.Context, taskID string) error {
 	if err != nil {
 		return err
 	}
+	if err := assertExecutionFences(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	statements := []string{
+		"DELETE FROM benchmark_acceptance_checks WHERE run_id IN (SELECT id FROM benchmark_acceptance_runs WHERE task_id = ?)",
+		"DELETE FROM benchmark_acceptance_runs WHERE task_id = ?",
+		"DELETE FROM forge_check_runs WHERE link_id IN (SELECT id FROM task_pr_links WHERE task_id = ?)",
+		"DELETE FROM forge_review_threads WHERE link_id IN (SELECT id FROM task_pr_links WHERE task_id = ?)",
+		"DELETE FROM forge_pr_snapshots WHERE link_id IN (SELECT id FROM task_pr_links WHERE task_id = ?)",
+		"DELETE FROM task_pr_links WHERE task_id = ?",
+		"DELETE FROM task_pr_groups WHERE task_id = ?",
 		"DELETE FROM repair_attempts WHERE stream_id IN (SELECT id FROM streams WHERE task_id = ?)",
 		"DELETE FROM parser_errors WHERE stream_id IN (SELECT id FROM streams WHERE task_id = ?)",
 		"DELETE FROM streams WHERE task_id = ?",
@@ -109,7 +120,7 @@ func (db *DB) DeleteTaskCascade(ctx context.Context, taskID string) error {
 }
 
 func (db *DB) LinkTaskRepo(ctx context.Context, taskID, repoID string) error {
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := db.fencedExecContext(ctx, `
 INSERT INTO task_repos (task_id, repo_id)
 VALUES (?, ?)
 ON CONFLICT(task_id, repo_id) DO NOTHING`,
@@ -118,7 +129,7 @@ ON CONFLICT(task_id, repo_id) DO NOTHING`,
 }
 
 func (db *DB) InsertWorktree(ctx context.Context, wt Worktree) error {
-	_, err := db.conn.ExecContext(ctx, `
+	_, err := db.fencedExecContext(ctx, `
 INSERT INTO worktrees (id, task_id, repo_id, path, start_ref, start_commit)
 VALUES (?, ?, ?, ?, ?, ?)`,
 		wt.ID, wt.TaskID, wt.RepoID, wt.Path, wt.StartRef, wt.StartCommit)
@@ -145,12 +156,4 @@ ORDER BY repo_id`, taskID)
 		worktrees = append(worktrees, wt)
 	}
 	return worktrees, rows.Err()
-}
-
-func (db *DB) InsertLease(ctx context.Context, id, taskID, role, leaseState string) error {
-	_, err := db.conn.ExecContext(ctx, `
-INSERT INTO leases (id, task_id, role, state)
-VALUES (?, ?, ?, ?)`,
-		id, taskID, role, leaseState)
-	return err
 }

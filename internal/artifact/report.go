@@ -7,22 +7,30 @@ import (
 	"strings"
 )
 
-var allowedRoleReports = map[string]map[string]bool{
-	"planner":     {"plan.mdx": true},
-	"implementer": {"implementation.mdx": true},
-	"reviewer":    {"review.mdx": true},
-	"compactor":   {"compaction.mdx": true},
+var roleReportPaths = map[string]string{
+	"planner":     "plan.mdx",
+	"implementer": "implementation.mdx",
+	"reviewer":    "review.mdx",
+	"compactor":   "compaction.mdx",
 }
 
 func ValidateReportPath(role, path string) error {
-	allowed, ok := allowedRoleReports[role]
-	if !ok {
-		return fmt.Errorf("unknown role %q", role)
+	expected, err := RoleReportPath(role)
+	if err != nil {
+		return err
 	}
-	if !allowed[path] {
+	if path != expected {
 		return fmt.Errorf("report path %q is not allowed for role %q", path, role)
 	}
 	return ValidatePath(path)
+}
+
+func RoleReportPath(role string) (string, error) {
+	path, ok := roleReportPaths[role]
+	if !ok {
+		return "", fmt.Errorf("unknown role %q", role)
+	}
+	return path, nil
 }
 
 func ValidateSafeMDX(data []byte) error {

@@ -199,7 +199,9 @@ func TestTaskCommandsCreateStatusAndDiff(t *testing.T) {
 		t.Fatalf("task run failed: %v\nstderr:\n%s", err, errOut.String())
 	}
 	runOut := out.String()
-	if !strings.Contains(runOut, "state: completed") || !strings.Contains(runOut, "patch: patch.diff") || !strings.Contains(runOut, "cost: $") {
+	if !strings.Contains(runOut, "state: completed") ||
+		!strings.Contains(runOut, "patch: patch.diff") ||
+		!strings.Contains(runOut, "cost: unknown (fake provider)") {
 		t.Fatalf("task run output:\n%s", runOut)
 	}
 	out.Reset()
@@ -283,6 +285,7 @@ func TestTaskCommandsCreateStatusAndDiff(t *testing.T) {
       "objective": "exercise benchmark suite command",
       "task_id": "task_cli_suite",
       "repo_ids": ["repo1"],
+      "checks": ["git diff --check"],
       "expected_touched_files": ["README.md"]
     }
   ]
@@ -305,9 +308,164 @@ func TestTaskCommandsCreateStatusAndDiff(t *testing.T) {
 	}
 	suiteOut := out.String()
 	if !strings.Contains(suiteOut, "benchmark: cli-suite-bench") ||
+		!strings.Contains(suiteOut, "run: benchmark_run_") ||
 		!strings.Contains(suiteOut, "task: task_cli_suite item:suite-item state:completed") ||
-		!strings.Contains(suiteOut, "item: suite-item score:pass") {
+		!strings.Contains(suiteOut, "action:created") ||
+		!strings.Contains(suiteOut, "item: suite-item score:pass") ||
+		!strings.Contains(suiteOut, "acceptance:passed") {
 		t.Fatalf("benchmark suite output:\n%s", suiteOut)
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{
+		"benchmark", "run",
+		"--root", root,
+		"--manifest", suiteManifest,
+		"--provider", "fake",
+		"--planner-stream", suitePlanner,
+		"--implementer-stream", suiteImplementer,
+		"--reviewer-stream", suiteReviewer,
+		"--max-output-tokens", "512",
+	}, nil, &out, &errOut); err != nil {
+		t.Fatalf("benchmark suite resume failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "action:reused") {
+		t.Fatalf("benchmark suite did not resume completed task:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{
+		"benchmark", "verify", "--root", root, "--manifest", suiteManifest, "--acceptance-timeout", "30s",
+	}, nil, &out, &errOut); err != nil {
+		t.Fatalf("benchmark verify failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "item: suite-item score:pass") {
+		t.Fatalf("benchmark verify output:\n%s", out.String())
+	}
+}
+
+func TestForgePRCommandsLinkRefreshAndStatus(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	repo := initCLITestRepo(t)
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if err := Run(ctx, []string{"workbench", "init", "--root", root, "--name", "forge-cli-test"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("init failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"workbench", "add-repo", "--root", root, "--id", "repo1", "--path", repo, "--main-ref", "main"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("add repo failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "create", "--root", root, "--id", "task_forge", "--objective", "track linked PR"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task create failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"forge", "repo", "link", "--root", root, "--repo", "repo1", "--forge", "github", "--remote", "example/project"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("forge repo link failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "forge: github-main") || !strings.Contains(out.String(), "remote: example/project") {
+		t.Fatalf("repo link output:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "link", "--root", root, "--task", "task_forge", "--repo", "repo1", "--pr", "42", "--head-sha", "abcdef1234567890"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr link failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "pr: github-main#42") || !strings.Contains(out.String(), "url: https://github.com/example/project/pull/42") {
+		t.Fatalf("pr link output:\n%s", out.String())
+	}
+	snapshot := filepath.Join(root, "snapshot.json")
+	if err := os.WriteFile(snapshot, []byte(`{
+  "state": "open",
+  "title": "Fix public catalog metadata",
+  "author": "alice",
+  "labels": ["bug"],
+  "mergeable_state": "clean",
+  "review_decision": "changes_requested",
+  "check_conclusion": "failure",
+  "unresolved_thread_count": 2,
+  "head_sha": "abcdef1234567890",
+  "checks": [{"name":"unit","status":"completed","conclusion":"failure"}],
+  "threads": [{"id":"thread-1","path":"README.md","line":7,"resolved":false,"last_author":"bob"}]
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "refresh", "--root", root, "--task", "task_forge", "--repo", "repo1", "--pr", "42", "--snapshot", snapshot}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr refresh failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "checks: 1") || !strings.Contains(out.String(), "threads: 1") || !strings.Contains(out.String(), "artifact: artifact:forge/") {
+		t.Fatalf("refresh output:\n%s", out.String())
+	}
+	snapshots, err := filepath.Glob(filepath.Join(root, ".midgard", "artifacts", "task_forge", "forge", "task_forge_repo1_github-main_42", "forge_snap_*", "snapshot.json"))
+	if err != nil || len(snapshots) != 1 {
+		t.Fatalf("snapshot artifacts = %#v, err=%v", snapshots, err)
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "status", "--root", root, "--task", "task_forge"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr status failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "state: open draft:false checks:failure review:changes_requested unresolved_threads:2") ||
+		!strings.Contains(out.String(), "check: unit status:completed conclusion:failure") ||
+		!strings.Contains(out.String(), "thread: thread-1 path:README.md line:7 resolved:false") {
+		t.Fatalf("status output:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "status", "--root", root, "--task", "task_forge", "--for-agent"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr status --for-agent failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "repo:repo1 pr:github-main#42 head:abcdef123456 state:open checks:failure review:changes_requested threads:2") ||
+		!strings.Contains(out.String(), "warnings:pr-open,checks-failure,changes-requested,unresolved-threads,head-mismatch") ||
+		!strings.Contains(out.String(), "refs:forge:artifact:forge/") {
+		t.Fatalf("agent status output:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "list", "--root", root, "--task", "task_forge"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr list failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "repo:repo1 pr:github-main#42") {
+		t.Fatalf("list output:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "checks", "--root", root, "--task", "task_forge", "--repo", "repo1", "--pr", "42"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr checks failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "artifact: artifact:forge/") || !strings.Contains(out.String(), "check: unit status:completed conclusion:failure") {
+		t.Fatalf("checks output:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "threads", "--root", root, "--task", "task_forge", "--repo", "repo1", "--pr", "https://github.com/example/project/pull/42"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr threads failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "complete: true") || !strings.Contains(out.String(), "thread: thread-1 path:README.md line:7 resolved:false") {
+		t.Fatalf("threads output:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "unlink", "--root", root, "--task", "task_forge", "--repo", "repo1", "--pr", "https://github.com/example/project/pull/42"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr unlink failed: %v\nstderr:\n%s", err, errOut.String())
+	}
+	if !strings.Contains(out.String(), "unlinked: true") {
+		t.Fatalf("unlink output:\n%s", out.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if err := Run(ctx, []string{"task", "pr", "list", "--root", root, "--task", "task_forge"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("task pr list after unlink failed: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("links remain after unlink:\n%s", out.String())
 	}
 }
 
@@ -331,9 +489,17 @@ func TestBenchmarkImportPRCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	referenceDiff, err := gitrepo.Run(ctx, repo, "diff", baseCommit+".."+mergedCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/example/project/pulls/9":
+			if r.Header.Get("Accept") == "application/vnd.github.diff" {
+				_, _ = w.Write([]byte(referenceDiff + "\n"))
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number":           9,
 				"title":            "CLI import fixture",
@@ -367,6 +533,7 @@ func TestBenchmarkImportPRCommand(t *testing.T) {
 		"--out", manifest,
 		"--clone-url", repo,
 		"--github-api-url", server.URL,
+		"--check", "git diff --check",
 	}, nil, &out, &errOut); err != nil {
 		t.Fatalf("benchmark import-pr failed: %v\nstderr:\n%s", err, errOut.String())
 	}
@@ -380,7 +547,8 @@ func TestBenchmarkImportPRCommand(t *testing.T) {
 	}
 	text := string(data)
 	if !strings.Contains(text, `"hidden_reference_patch": "references/example-project-pr-9.patch"`) ||
-		!strings.Contains(text, `"checkout_ref": "`+baseCommit+`"`) {
+		!strings.Contains(text, `"checkout_ref": "`+baseCommit+`"`) ||
+		!strings.Contains(text, `"command": "git diff --check"`) {
 		t.Fatalf("manifest:\n%s", text)
 	}
 	if _, err := os.Stat(filepath.Join(root, "references", "example-project-pr-9.patch")); err != nil {
@@ -390,6 +558,7 @@ func TestBenchmarkImportPRCommand(t *testing.T) {
 
 func TestDeepSeekCLIProfileUsesV4ProPricingAndMaxEffort(t *testing.T) {
 	t.Setenv("DEEPSEEK_API_KEY", "test-key")
+	t.Setenv(deepseek.ReasoningEffortEnvName, "high")
 	provider, err := roleProviderWithOptions("deepseek", "", providerOptions{DeepSeekReasoningEffort: "max"})
 	if err != nil {
 		t.Fatal(err)
@@ -400,6 +569,12 @@ func TestDeepSeekCLIProfileUsesV4ProPricingAndMaxEffort(t *testing.T) {
 	}
 	if client.ReasoningEffort != "max" {
 		t.Fatalf("reasoning effort = %q", client.ReasoningEffort)
+	}
+	if got := benchmarkProviderOptions("deepseek", "max"); got != "reasoning_effort=max" {
+		t.Fatalf("explicit benchmark provider options = %q", got)
+	}
+	if got := benchmarkProviderOptions("deepseek", ""); got != "reasoning_effort=high" {
+		t.Fatalf("environment benchmark provider options = %q", got)
 	}
 	pricing := pricingForProvider("deepseek", "deepseek-v4-pro")
 	if pricing.ProviderID != "deepseek" ||

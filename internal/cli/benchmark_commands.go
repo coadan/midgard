@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"time"
 
 	"midgard/internal/benchmark"
 	"midgard/internal/cost"
@@ -28,8 +30,16 @@ func runBenchmark(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		referencePath := fs.String("reference-patch", "", "output reference patch path")
 		cloneURL := fs.String("clone-url", "", "override clone URL for generating the reference patch")
 		apiBaseURL := fs.String("github-api-url", "", "GitHub API base URL")
+		var checks stringListFlag
+		fs.Var(&checks, "check", "authoritative acceptance command; repeat for multiple checks")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
+		}
+		acceptanceChecks := make([]benchmark.AcceptanceCheck, 0, len(checks))
+		for i, commandText := range checks {
+			acceptanceChecks = append(acceptanceChecks, benchmark.AcceptanceCheck{
+				ID: fmt.Sprintf("check-%d", i+1), RepoID: "repo1", Command: commandText,
+			})
 		}
 		result, err := benchmark.ImportPR(ctx, benchmark.ImportPROptions{
 			Repo:          *repo,
@@ -39,6 +49,7 @@ func runBenchmark(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			CloneURL:      *cloneURL,
 			APIBaseURL:    *apiBaseURL,
 			Token:         githubToken(),
+			Checks:        acceptanceChecks,
 		})
 		if err != nil {
 			return err
@@ -52,7 +63,7 @@ func runBenchmark(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return nil
 	case "suite":
 		return runBenchmarkSuite(ctx, args[1:], stdout, stderr, "fake")
-	case "run", "report":
+	case "run", "report", "verify":
 		fs := flag.NewFlagSet("midgard benchmark "+args[0], flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		root := fs.String("root", "", "workbench root or search start")
@@ -66,7 +77,10 @@ func runBenchmark(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		maxOutputTokens := fs.Int("max-output-tokens", 4096, "provider max output tokens")
 		maxReviewCycles := fs.Int("max-review-cycles", 2, "maximum implement/review cycles")
 		maxSourceEditRepairs := fs.Int("max-source-edit-repairs", 2, "maximum source edit apply repairs")
-		resetTasks := fs.Bool("reset", true, "reset existing benchmark tasks before running")
+		acceptanceTimeout := fs.Duration("acceptance-timeout", 5*time.Minute, "default timeout for each authoritative acceptance check")
+		acceptanceMaxStdout := fs.Int64("acceptance-max-stdout", 64<<10, "stdout byte cap for each acceptance check")
+		acceptanceMaxStderr := fs.Int64("acceptance-max-stderr", 64<<10, "stderr byte cap for each acceptance check")
+		resetTasks := fs.Bool("reset", false, "discard durable benchmark state and start a new run")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -74,10 +88,10 @@ func runBenchmark(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			return fmt.Errorf("manifest is required")
 		}
 		if args[0] == "run" && *providerName != "" {
-			return runBenchmarkSuiteWithOptions(ctx, stdout, *root, *manifestPath, *providerName, *plannerStream, *implementerStream, *reviewerStream, *modelID, *deepseekReasoningEffort, *maxOutputTokens, *maxReviewCycles, *maxSourceEditRepairs, *resetTasks)
+			return runBenchmarkSuiteWithOptions(ctx, stdout, *root, *manifestPath, *providerName, *plannerStream, *implementerStream, *reviewerStream, *modelID, *deepseekReasoningEffort, *maxOutputTokens, *maxReviewCycles, *maxSourceEditRepairs, *acceptanceTimeout, *acceptanceMaxStdout, *acceptanceMaxStderr, *resetTasks)
 		}
-		if args[0] == "report" && *providerName != "" {
-			return fmt.Errorf("benchmark report does not execute providers; use benchmark run --provider %s", *providerName)
+		if args[0] != "run" && *providerName != "" {
+			return fmt.Errorf("benchmark %s does not execute providers; use benchmark run --provider %s", args[0], *providerName)
 		}
 		start, err := rootOrCWD(*root)
 		if err != nil {
@@ -87,7 +101,14 @@ func runBenchmark(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		if err != nil {
 			return err
 		}
-		report, err := benchmark.Run(ctx, start, manifest)
+		var report benchmark.Report
+		if args[0] == "verify" {
+			report, err = benchmark.Verify(ctx, start, manifest, benchmark.AcceptanceOptions{
+				DefaultTimeout: *acceptanceTimeout, MaxStdoutBytes: *acceptanceMaxStdout, MaxStderrBytes: *acceptanceMaxStderr,
+			})
+		} else {
+			report, err = benchmark.Run(ctx, start, manifest)
+		}
 		if err != nil {
 			return err
 		}
@@ -116,17 +137,20 @@ func runBenchmarkSuite(ctx context.Context, args []string, stdout, stderr io.Wri
 	maxOutputTokens := fs.Int("max-output-tokens", 4096, "provider max output tokens")
 	maxReviewCycles := fs.Int("max-review-cycles", 2, "maximum implement/review cycles")
 	maxSourceEditRepairs := fs.Int("max-source-edit-repairs", 2, "maximum source edit apply repairs")
-	resetTasks := fs.Bool("reset", true, "reset existing benchmark tasks before running")
+	acceptanceTimeout := fs.Duration("acceptance-timeout", 5*time.Minute, "default timeout for each authoritative acceptance check")
+	acceptanceMaxStdout := fs.Int64("acceptance-max-stdout", 64<<10, "stdout byte cap for each acceptance check")
+	acceptanceMaxStderr := fs.Int64("acceptance-max-stderr", 64<<10, "stderr byte cap for each acceptance check")
+	resetTasks := fs.Bool("reset", false, "discard durable benchmark state and start a new run")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *manifestPath == "" {
 		return fmt.Errorf("manifest is required")
 	}
-	return runBenchmarkSuiteWithOptions(ctx, stdout, *root, *manifestPath, *providerName, *plannerStream, *implementerStream, *reviewerStream, *modelID, *deepseekReasoningEffort, *maxOutputTokens, *maxReviewCycles, *maxSourceEditRepairs, *resetTasks)
+	return runBenchmarkSuiteWithOptions(ctx, stdout, *root, *manifestPath, *providerName, *plannerStream, *implementerStream, *reviewerStream, *modelID, *deepseekReasoningEffort, *maxOutputTokens, *maxReviewCycles, *maxSourceEditRepairs, *acceptanceTimeout, *acceptanceMaxStdout, *acceptanceMaxStderr, *resetTasks)
 }
 
-func runBenchmarkSuiteWithOptions(ctx context.Context, stdout io.Writer, root, manifestPath, providerName, plannerStream, implementerStream, reviewerStream, modelID, deepseekReasoningEffort string, maxOutputTokens, maxReviewCycles, maxSourceEditRepairs int, resetTasks bool) error {
+func runBenchmarkSuiteWithOptions(ctx context.Context, stdout io.Writer, root, manifestPath, providerName, plannerStream, implementerStream, reviewerStream, modelID, deepseekReasoningEffort string, maxOutputTokens, maxReviewCycles, maxSourceEditRepairs int, acceptanceTimeout time.Duration, acceptanceMaxStdout, acceptanceMaxStderr int64, resetTasks bool) error {
 	if providerName == "" {
 		return fmt.Errorf("provider is required")
 	}
@@ -149,26 +173,45 @@ func runBenchmarkSuiteWithOptions(ctx context.Context, stdout io.Writer, root, m
 	}
 	result, err := benchmark.RunSuite(ctx, start, manifest, benchmark.SuiteOptions{
 		ProviderFactory:      factory,
+		ProviderOptions:      benchmarkProviderOptions(providerName, deepseekReasoningEffort),
 		Budget:               streamBudget(maxOutputTokens),
 		MaxReviewCycles:      maxReviewCycles,
 		MaxSourceEditRepairs: maxSourceEditRepairs,
-		ResetTasks:           resetTasks,
+		Acceptance: benchmark.AcceptanceOptions{
+			DefaultTimeout: acceptanceTimeout, MaxStdoutBytes: acceptanceMaxStdout, MaxStderrBytes: acceptanceMaxStderr,
+		},
+		ResetTasks: resetTasks,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "benchmark: %s\n", result.Report.ManifestID)
+	fmt.Fprintf(stdout, "run: %s status:%s\n", result.RunID, result.RunStatus)
 	fmt.Fprintf(stdout, "report: %s\n", result.Report.Path)
 	for _, repo := range result.PreparedRepos {
 		fmt.Fprintf(stdout, "repo: %s path:%s checkout_ref:%s start_commit:%s\n", repo.ID, repo.Path, repo.CheckoutRef, repo.StartCommit)
 	}
 	for _, taskRun := range result.TaskRuns {
-		fmt.Fprintf(stdout, "task: %s item:%s state:%s cost:$%.6f\n", taskRun.TaskID, taskRun.ItemID, taskRun.State, taskRun.CostUSD)
+		fmt.Fprintf(stdout, "task: %s item:%s state:%s action:%s cost:$%.6f\n", taskRun.TaskID, taskRun.ItemID, taskRun.State, firstCLIValue(taskRun.Action, "unknown"), taskRun.CostUSD)
+		if taskRun.Error != "" {
+			fmt.Fprintf(stdout, "task_error: %s item:%s class:%s error:%s\n", taskRun.TaskID, taskRun.ItemID, firstCLIValue(taskRun.ErrorClass, "unknown"), strings.ReplaceAll(taskRun.Error, "\n", " "))
+		}
 	}
 	for _, scored := range result.Report.Results {
-		fmt.Fprintf(stdout, "item: %s score:%s task:%s patch_bytes:%d cost:$%.6f\n", scored.ItemID, scored.Score, scored.Evidence.TaskID, scored.Evidence.PatchBytes, scored.Evidence.CostUSD)
+		fmt.Fprintf(stdout, "item: %s score:%s task:%s patch_bytes:%d acceptance:%s cost:$%.6f\n", scored.ItemID, scored.Score, scored.Evidence.TaskID, scored.Evidence.PatchBytes, firstCLIValue(scored.Evidence.AcceptanceStatus, "none"), scored.Evidence.CostUSD)
 	}
 	return nil
+}
+
+func benchmarkProviderOptions(providerName, deepseekReasoningEffort string) string {
+	switch providerName {
+	case "deepseek":
+		return "reasoning_effort=" + resolvedDeepSeekReasoningEffort(deepseekReasoningEffort)
+	case "codex":
+		return "base_url=" + strings.TrimSpace(os.Getenv("MIDGARD_CODEX_BASE_URL"))
+	default:
+		return ""
+	}
 }
 
 func githubToken() string {
@@ -178,6 +221,21 @@ func githubToken() string {
 	return os.Getenv("GH_TOKEN")
 }
 
+type stringListFlag []string
+
+func (values *stringListFlag) String() string {
+	return strings.Join(*values, ",")
+}
+
+func (values *stringListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("value cannot be empty")
+	}
+	*values = append(*values, value)
+	return nil
+}
+
 func printBenchmarkUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: midgard benchmark <command> [args]")
 	fmt.Fprintln(w)
@@ -185,5 +243,6 @@ func printBenchmarkUsage(w io.Writer) {
 	fmt.Fprintln(w, "  import-pr import a merged GitHub PR into a benchmark manifest")
 	fmt.Fprintln(w, "  run     execute benchmark items with --provider, then score/report")
 	fmt.Fprintln(w, "  report  regenerate benchmark report without executing providers")
+	fmt.Fprintln(w, "  verify  rerun authoritative acceptance checks, then regenerate the report")
 	fmt.Fprintln(w, "  suite   alias for run --provider fake unless --provider is supplied")
 }

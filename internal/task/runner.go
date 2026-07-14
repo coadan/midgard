@@ -16,14 +16,17 @@ type RunnerOptions struct {
 	MaxReviewCycles      int
 	MaxSourceEditRepairs int
 	MaxCommandTurns      int
+	ExternalContext      string
 }
 
 type LoopResult struct {
-	TaskID    string
-	State     string
-	PatchPath string
-	CostUSD   float64
-	RoleRuns  []RoleRun
+	TaskID      string
+	State       string
+	PatchPath   string
+	CostUSD     float64
+	CostCaveats []string
+	RoleRuns    []RoleRun
+	Error       string
 }
 
 type RoleRun struct {
