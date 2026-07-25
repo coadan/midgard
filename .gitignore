@@ -20,3 +20,6 @@ coverage.out
 .midgard/state.sqlite-*
 .midgard/worktrees/
 .midgard/artifacts/
+
+# Local Heimdal browser sessions and evidence
+.heimdal/
