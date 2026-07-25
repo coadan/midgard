@@ -31,8 +31,8 @@ Core direction:
   metadata and evidence.
 - DeepSeek V4 is the initial low-cost provider target.
 - Ygg is an optional external context dependency, not a Git submodule.
-- Planner, implementer, reviewer, and compactor can use separate role model
-  selections.
+- One coding agent is the normal task path. Planner/reviewer role workflows
+  remain optional for explicit experiments and benchmarks.
 
 The product is the harness and evidence trail, not the chat UI alone.
 
@@ -94,7 +94,7 @@ Build the smallest vertical slice first:
 3. Task creation.
 4. Task-owned Git worktree creation.
 5. SQLite state and artifact writes.
-6. DeepSeek provider worker.
+6. Codex provider worker with local Codex authentication and model defaults.
 7. Tagged stream parsing.
 8. Local HTTP+SSE server.
 9. React browser client with slash commands, streamed output, artifact
@@ -111,6 +111,10 @@ Build the smallest vertical slice first:
 - Browser UI and CLI are clients, not orchestration owners.
 - Provider workers normalize streams and usage but cannot bypass policy.
 - Shell commands are the primary execution surface for agent operations.
+- Root repository `AGENTS.md` guidance is included in every coding task;
+  agents inspect closer nested guidance before editing those paths.
+- Heimdal is advertised automatically when it is on `PATH`, keeping browser
+  QA optional without adding MCP configuration.
 - Cost is computed from observed usage, not projected remaining work.
 - Ygg integration must be replaceable and Midgard must run without it in
   degraded Git/file/lexical context mode.

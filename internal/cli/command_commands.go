@@ -90,12 +90,13 @@ func runCommandRun(ctx context.Context, args []string, stdout, stderr io.Writer)
 	commandPolicy.Limits.MaxStderrBytes = *maxStderr
 	executor := command.NewExecutor(commandPolicy)
 	result, err := executor.Run(ctx, command.Request{
-		TaskID:      *taskID,
-		RepoID:      wt.RepoID,
-		Command:     commandLine,
-		CWD:         cwd,
-		ArtifactDir: artifactDir,
-		Fence:       midgardtask.CheckExecution,
+		TaskID:             *taskID,
+		RepoID:             wt.RepoID,
+		Command:            commandLine,
+		CWD:                cwd,
+		ArtifactDir:        artifactDir,
+		Fence:              midgardtask.CheckExecution,
+		PreserveFullOutput: true,
 	})
 	if err != nil {
 		return err

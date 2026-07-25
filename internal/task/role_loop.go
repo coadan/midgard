@@ -985,13 +985,15 @@ func singleLine(value string) string {
 func appendCommandContinuationResult(b *strings.Builder, store artifact.Store, result command.Result) {
 	fmt.Fprintf(
 		b,
-		"command id:%s repo:%s exit:%d timed_out:%t stdout:artifact:%s stderr:artifact:%s result:artifact:%s stdout_truncated:%t stderr_truncated:%t\n",
+		"command id:%s repo:%s exit:%d timed_out:%t stdout:artifact:%s stdout_bytes:%d stderr:artifact:%s stderr_bytes:%d result:artifact:%s stdout_preview_truncated:%t stderr_preview_truncated:%t\n",
 		result.ID,
 		result.RepoID,
 		result.ExitCode,
 		result.TimedOut,
 		result.StdoutPath,
+		result.StdoutBytes,
 		result.StderrPath,
+		result.StderrBytes,
 		result.ResultPath,
 		result.StdoutTruncated,
 		result.StderrTruncated,
@@ -1013,20 +1015,17 @@ func appendCommandContinuationResult(b *strings.Builder, store artifact.Store, r
 }
 
 func commandPreview(store artifact.Store, path string) string {
-	data, err := store.Read(path)
-	if err != nil || len(data) == 0 {
+	head, tail, size, err := store.ReadHeadTail(path, maxCommandContinuationPreviewBytes)
+	if err != nil || size == 0 {
 		return ""
 	}
-	text := string(data)
-	if len(text) > maxCommandContinuationPreviewBytes {
-		head := maxCommandContinuationPreviewBytes * 2 / 3
-		tail := maxCommandContinuationPreviewBytes - head
-		omitted := len(text) - head - tail
-		text = text[:head] +
-			fmt.Sprintf("\n[command output preview truncated; %d bytes omitted. Run a narrower command for missing middle content.]\n", omitted) +
-			text[len(text)-tail:]
+	if len(tail) == 0 {
+		return string(head)
 	}
-	return text
+	omitted := size - int64(len(head)) - int64(len(tail))
+	return string(head) +
+		fmt.Sprintf("\n[command output preview compacted; %d bytes omitted; full output is in the artifact.]\n", omitted) +
+		string(tail)
 }
 
 func executeProposal(ctx context.Context, db *state.DB, layout workbench.Layout, taskID string, role model.Role, worktrees []WorktreeStatus, proposal stream.CommandProposal) (command.Result, error) {
@@ -1061,12 +1060,13 @@ func executeProposal(ctx context.Context, db *state.DB, layout workbench.Layout,
 	defer cleanup()
 	executor := command.NewExecutor(commandPolicy)
 	result, err := executor.Run(ctx, command.Request{
-		TaskID:      taskID,
-		RepoID:      wt.RepoID,
-		Command:     proposal.Command,
-		CWD:         commandRoot,
-		ArtifactDir: artifactDir,
-		Fence:       CheckExecution,
+		TaskID:             taskID,
+		RepoID:             wt.RepoID,
+		Command:            proposal.Command,
+		CWD:                commandRoot,
+		ArtifactDir:        artifactDir,
+		Fence:              CheckExecution,
+		PreserveFullOutput: true,
 	})
 	if err != nil {
 		return command.Result{}, err

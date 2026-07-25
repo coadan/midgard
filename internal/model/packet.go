@@ -432,6 +432,8 @@ Use mode:patch @edit frames for direct source edits. Use shell command proposals
 If source_context is insufficient, inspect with @cmd repo:<repo-id> -- <command> and wait for command results before editing.
 Do not return blocked solely because file context is missing while @cmd inspection can still gather it.
 Prefer rg/sed/git commands for inspection. Do not use @cmd to make source edits unless executing an audited generated artifact.
+Treat repository_guidance as authoritative repository instructions. Before editing a nested directory, inspect any closer AGENTS.md that applies.
+When Heimdal is listed as available and browser behavior is in scope, use it for Playwright browser QA from the task worktree.
 If review_findings is present, address every P0/P1 finding against the current worktree_diff before returning ready.
 If latest_role_statuses or latest_role_reports contains a changes-requested review, fix that review against the current worktree_diff.
 Patch the current worktree state; do not reapply the same rejected patch.

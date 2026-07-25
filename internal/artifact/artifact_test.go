@@ -1,6 +1,8 @@
 package artifact
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -26,6 +28,33 @@ func TestStorePutReadAndChecksum(t *testing.T) {
 	}
 	if string(data) != "print('ok')\n" {
 		t.Fatalf("artifact data = %q", data)
+	}
+}
+
+func TestStorePutFileAndReadHeadTail(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.txt")
+	if err := os.WriteFile(source, []byte("abcdefghij"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(filepath.Join(root, "artifacts"))
+	record, err := store.PutFile(Record{
+		Path:  "commands/cmd/stdout.txt",
+		Type:  TypePayload,
+		State: StateSealed,
+	}, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Size != 10 || record.Checksum == "" {
+		t.Fatalf("record = %#v", record)
+	}
+	head, tail, size, err := store.ReadHeadTail(record.Path, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(head) != "abcd" || string(tail) != "ij" || size != 10 {
+		t.Fatalf("head=%q tail=%q size=%d", head, tail, size)
 	}
 }
 

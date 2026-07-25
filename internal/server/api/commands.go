@@ -63,13 +63,14 @@ func (api *API) handleCommandRun(w http.ResponseWriter, r *http.Request) {
 	artifactDir := filepath.Join(api.layout.Artifacts, req.TaskID)
 	executor := command.NewExecutor(policy.DefaultCommandPolicy(wt.Path, artifactDir))
 	result, err := executor.Run(r.Context(), command.Request{
-		TaskID:      req.TaskID,
-		RepoID:      wt.RepoID,
-		Command:     req.Command,
-		CWD:         cwd,
-		ArtifactDir: artifactDir,
-		Env:         req.Env,
-		Fence:       midgardtask.CheckExecution,
+		TaskID:             req.TaskID,
+		RepoID:             wt.RepoID,
+		Command:            req.Command,
+		CWD:                cwd,
+		ArtifactDir:        artifactDir,
+		Env:                req.Env,
+		Fence:              midgardtask.CheckExecution,
+		PreserveFullOutput: true,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

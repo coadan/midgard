@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,6 +53,19 @@ func (e Executor) Run(ctx context.Context, req Request) (Result, error) {
 	if err := os.MkdirAll(req.ArtifactDir, 0o755); err != nil {
 		return Result{}, err
 	}
+	stdoutFile, err := os.CreateTemp(req.ArtifactDir, ".midgard-stdout-*")
+	if err != nil {
+		return Result{}, err
+	}
+	stdoutTemp := stdoutFile.Name()
+	defer os.Remove(stdoutTemp)
+	stderrFile, err := os.CreateTemp(req.ArtifactDir, ".midgard-stderr-*")
+	if err != nil {
+		_ = stdoutFile.Close()
+		return Result{}, err
+	}
+	stderrTemp := stderrFile.Name()
+	defer os.Remove(stderrTemp)
 	id := req.ID
 	if id == "" {
 		id = newCommandID()
@@ -87,9 +101,17 @@ func (e Executor) Run(ctx context.Context, req Request) (Result, error) {
 	cmd.Env = e.Policy.Environment(req.Env)
 	stdout := &limitedBuffer{limit: e.Policy.Limits.MaxStdoutBytes}
 	stderr := &limitedBuffer{limit: e.Policy.Limits.MaxStderrBytes}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	err := cmd.Run()
+	cmd.Stdout = io.MultiWriter(stdoutFile, stdout)
+	cmd.Stderr = io.MultiWriter(stderrFile, stderr)
+	err = cmd.Run()
+	stdoutCloseErr := stdoutFile.Close()
+	stderrCloseErr := stderrFile.Close()
+	if stdoutCloseErr != nil {
+		return Result{}, stdoutCloseErr
+	}
+	if stderrCloseErr != nil {
+		return Result{}, stderrCloseErr
+	}
 	result.FinishedAt = time.Now().UTC()
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		result.TimedOut = true
@@ -119,11 +141,18 @@ func (e Executor) Run(ctx context.Context, req Request) (Result, error) {
 	stdoutPath := filepath.ToSlash(filepath.Join(prefix, "stdout.txt"))
 	stderrPath := filepath.ToSlash(filepath.Join(prefix, "stderr.txt"))
 	resultPath := filepath.ToSlash(filepath.Join(prefix, "result.json"))
-	stdoutRec, err := store.Put(artifact.Record{Path: stdoutPath, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "text"}, stdout.bytes())
+	outputRecord := func(path, temp string, preview []byte) (artifact.Record, error) {
+		record := artifact.Record{Path: path, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "text"}
+		if req.PreserveFullOutput {
+			return store.PutFile(record, temp)
+		}
+		return store.Put(record, preview)
+	}
+	stdoutRec, err := outputRecord(stdoutPath, stdoutTemp, stdout.bytes())
 	if err != nil {
 		return Result{}, err
 	}
-	stderrRec, err := store.Put(artifact.Record{Path: stderrPath, Type: artifact.TypePayload, State: artifact.StateSealed, PayloadType: "text"}, stderr.bytes())
+	stderrRec, err := outputRecord(stderrPath, stderrTemp, stderr.bytes())
 	if err != nil {
 		return Result{}, err
 	}
@@ -132,6 +161,8 @@ func (e Executor) Run(ctx context.Context, req Request) (Result, error) {
 	result.ResultPath = resultPath
 	result.StdoutChecksum = stdoutRec.Checksum
 	result.StderrChecksum = stderrRec.Checksum
+	result.StdoutBytes = stdoutRec.Size
+	result.StderrBytes = stderrRec.Size
 	resultJSON, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return Result{}, err

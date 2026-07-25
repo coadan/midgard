@@ -56,7 +56,7 @@ func (r Runner) Run(ctx context.Context, packet Packet) (RunResult, error) {
 	current := packet
 	var result RunResult
 	var rawTranscript strings.Builder
-	var commandTranscript strings.Builder
+	var commandTurnsHistory []commandTurn
 	repairAttempts := 0
 	commandTurns := 0
 	commandLimitRepairUsed := false
@@ -119,7 +119,7 @@ func (r Runner) Run(ctx context.Context, packet Packet) (RunResult, error) {
 					return result, fmt.Errorf("command continuation turns exhausted after %d turns", maxCommandTurns)
 				}
 				commandLimitRepairUsed = true
-				current = CommandContinuationLimitPacket(packet, parsed, commandTranscript.String(), maxCommandTurns)
+				current = CommandContinuationLimitPacket(packet, parsed, compactCommandLedger(commandTurnsHistory), maxCommandTurns)
 				continue
 			}
 			commandTurns++
@@ -132,8 +132,8 @@ func (r Runner) Run(ctx context.Context, packet Packet) (RunResult, error) {
 			if err != nil {
 				return result, err
 			}
-			appendCommandTurn(&commandTranscript, commandTurns, commandResult)
-			current = CommandContinuationPacket(packet, parsed, commandTranscript.String())
+			commandTurnsHistory = append(commandTurnsHistory, commandTurn{number: commandTurns, text: commandResult})
+			current = CommandContinuationPacket(packet, parsed, compactCommandLedger(commandTurnsHistory))
 			continue
 		}
 		if parsed.Repair == nil &&
@@ -143,7 +143,7 @@ func (r Runner) Run(ctx context.Context, packet Packet) (RunResult, error) {
 				return result, nil
 			}
 			blockedCommandRetries++
-			current = UnproductiveCommandContinuationPacket(packet, parsed, commandTranscript.String())
+			current = UnproductiveCommandContinuationPacket(packet, parsed, compactCommandLedger(commandTurnsHistory))
 			continue
 		}
 		if parsed.Repair == nil && shouldRetryUnproductiveTerminalAfterRepair(current, parsed) {
@@ -577,13 +577,51 @@ func appendProviderTurn(b *strings.Builder, turn int, raw string) {
 	}
 }
 
-func appendCommandTurn(b *strings.Builder, turn int, text string) {
-	if b.Len() > 0 {
-		b.WriteByte('\n')
+const maxCommandLedgerBytes = 24 << 10
+
+type commandTurn struct {
+	number int
+	text   string
+}
+
+func compactCommandLedger(turns []commandTurn) string {
+	if len(turns) == 0 {
+		return ""
 	}
-	fmt.Fprintf(b, "command_turn:%d\n", turn)
-	b.WriteString(text)
-	if !strings.HasSuffix(text, "\n") {
-		b.WriteByte('\n')
+	var summaries strings.Builder
+	for _, turn := range turns {
+		fmt.Fprintf(&summaries, "command_turn:%d summary:\n", turn.number)
+		for _, line := range strings.Split(turn.text, "\n") {
+			if strings.HasPrefix(line, "command id:") || strings.HasPrefix(line, "command repo:") {
+				summaries.WriteString(line)
+				summaries.WriteByte('\n')
+			}
+		}
 	}
+	latest := turns[len(turns)-1]
+	var detail strings.Builder
+	fmt.Fprintf(&detail, "\nlatest_command_turn:%d detail:\n", latest.number)
+	detail.WriteString(latest.text)
+	if !strings.HasSuffix(latest.text, "\n") {
+		detail.WriteByte('\n')
+	}
+	result := summaries.String() + detail.String()
+	if len(result) <= maxCommandLedgerBytes {
+		return result
+	}
+	summary := summaries.String()
+	if len(summary) >= maxCommandLedgerBytes {
+		return summary[:maxCommandLedgerBytes] + "\n[command summaries truncated]\n"
+	}
+	remaining := maxCommandLedgerBytes - len(summary)
+	detailText := detail.String()
+	head := remaining * 2 / 3
+	tail := remaining - head
+	if head+tail >= len(detailText) {
+		return summary + detailText
+	}
+	omitted := len(detailText) - head - tail
+	return summary + detailText[:head] +
+		fmt.Sprintf("\n[latest command detail compacted; %d bytes omitted; use artifact refs or a narrower command]\n", omitted) +
+		detailText[len(detailText)-tail:]
 }

@@ -114,6 +114,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  task status        show task state")
 	fmt.Fprintln(w, "  task diff          show task diff")
 	fmt.Fprintln(w, "  task pr            inspect task pull requests")
+	fmt.Fprintln(w, "  task run           run one coding agent")
 	fmt.Fprintln(w, "  command run        run an audited command")
 	fmt.Fprintln(w, "  check record       record a check result")
 	fmt.Fprintln(w, "  serve              start local HTTP server")

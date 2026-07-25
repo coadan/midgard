@@ -41,11 +41,17 @@ func (api *API) handleTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) handleTask(w http.ResponseWriter, r *http.Request) {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/tasks/"), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "run" {
+		api.handleTaskRun(w, r, parts[0])
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
+	id := rest
 	if id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusNotFound, "not found")
 		return

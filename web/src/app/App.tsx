@@ -1,18 +1,19 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Send, SlidersHorizontal } from "lucide-react";
+import { Play, Plus, SlidersHorizontal } from "lucide-react";
 import { ArtifactWorkspace } from "../artifacts/ArtifactWorkspace";
 import { ActivityCard } from "../components/ai-elements/ActivityCard";
 import { Button } from "../components/ui/button";
-import { fetchArtifact, fetchArtifacts, fetchEvents, fetchTask } from "../lib/api";
+import { createTask, fetchArtifact, fetchArtifacts, fetchEvents, fetchTask, runTask } from "../lib/api";
 import type { ArtifactInfo, TaskStatus } from "../lib/types";
-import { connectTaskEvents } from "../stream/eventSource";
-import { addLocalActivity, applyServerEvent, createInitialTaskState, type TaskState } from "../task-store/store";
+import { applyServerEvent, createInitialTaskState, type TaskState } from "../task-store/store";
 
 export function App() {
-  const [taskId, setTaskId] = useState("task_smoke");
-  const [draftTaskId, setDraftTaskId] = useState("task_smoke");
-  const [state, setState] = useState<TaskState>(() => createInitialTaskState("task_smoke"));
-  const [input, setInput] = useState("");
+  const initialTaskId = useMemo(() => newTaskId(), []);
+  const [taskId, setTaskId] = useState(initialTaskId);
+  const [draftTaskId, setDraftTaskId] = useState(initialTaskId);
+  const [state, setState] = useState<TaskState>(() => createInitialTaskState(initialTaskId));
+  const [objective, setObjective] = useState("");
+  const [running, setRunning] = useState(false);
   const [artifactLoading, setArtifactLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -25,35 +26,38 @@ export function App() {
     }
   }, [taskId]);
 
-  const refreshTask = useCallback(async () => {
+  const loadTask = useCallback(async (id: string) => {
     try {
       const [status, events, artifacts] = await Promise.all([
-        fetchTask(taskId),
-        fetchEvents(taskId),
-        fetchArtifacts(taskId)
+        fetchTask(id),
+        fetchEvents(id),
+        fetchArtifacts(id)
       ]);
       setState((current) => ({
         ...current,
-        taskId,
+        taskId: id,
         status,
         artifacts,
-        activity: events.map((event) => applyServerEvent(createInitialTaskState(taskId), event).activity[0])
+        activity: events.map((event) => applyServerEvent(createInitialTaskState(id), event).activity[0])
       }));
       setError("");
     } catch (err) {
-      setState(createInitialTaskState(taskId));
+      setState(createInitialTaskState(id));
       setError(errorMessage(err));
     }
-  }, [taskId]);
+  }, []);
+
+  const refreshTask = useCallback(() => loadTask(taskId), [loadTask, taskId]);
 
   useEffect(() => {
-    void refreshTask();
-    const disconnect = connectTaskEvents(taskId, (event) => {
-      setState((current) => applyServerEvent(current, event));
-      void refreshArtifacts();
-    });
-    return disconnect;
-  }, [refreshArtifacts, refreshTask, taskId]);
+    if (!running) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void refreshTask();
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [refreshTask, running]);
 
   const selectArtifact = useCallback(
     async (path: string) => {
@@ -71,26 +75,29 @@ export function App() {
     [taskId]
   );
 
-  const submit = (event: FormEvent) => {
+  const createAndRun = async (event: FormEvent) => {
     event.preventDefault();
-    const value = input.trim();
-    if (!value) {
+    const value = objective.trim();
+    const id = draftTaskId.trim() || newTaskId();
+    if (!value || running) {
       return;
     }
-    if (value.startsWith("/task ")) {
-      const nextTask = value.slice(6).trim();
-      setTaskId(nextTask);
-      setDraftTaskId(nextTask);
-      setInput("");
-      return;
+    setRunning(true);
+    setError("");
+    try {
+      await createTask(id, value);
+      setTaskId(id);
+      setDraftTaskId(id);
+      setState(createInitialTaskState(id));
+      await runTask(id);
+      await loadTask(id);
+      setObjective("");
+    } catch (err) {
+      await loadTask(id);
+      setError(errorMessage(err));
+    } finally {
+      setRunning(false);
     }
-    if (value.startsWith("/artifact ")) {
-      void selectArtifact(value.slice(10).trim());
-      setInput("");
-      return;
-    }
-    setState((current) => addLocalActivity(current, value));
-    setInput("");
   };
 
   const dirtyCount = useMemo(() => state.status?.Worktrees?.filter((worktree) => worktree.Dirty).length ?? 0, [state.status]);
@@ -103,7 +110,13 @@ export function App() {
             <p className="eyebrow">Midgard</p>
             <h1>Task Harness</h1>
           </div>
-          <Button title="Load task" onClick={() => setTaskId(draftTaskId)}>
+          <Button
+            title="Load task"
+            onClick={() => {
+              setTaskId(draftTaskId);
+              void loadTask(draftTaskId);
+            }}
+          >
             <SlidersHorizontal size={16} />
             Load
           </Button>
@@ -114,7 +127,7 @@ export function App() {
             <span>Task</span>
             <input value={draftTaskId} onChange={(event) => setDraftTaskId(event.target.value)} />
           </label>
-          <StatusPill status={state.status} dirtyCount={dirtyCount} />
+          <StatusPill status={state.status} dirtyCount={dirtyCount} running={running} />
         </div>
 
         {error ? <div className="error-line">{error}</div> : null}
@@ -127,15 +140,41 @@ export function App() {
           )}
         </div>
 
-        <form className="composer" onSubmit={submit}>
+        <form className="composer" onSubmit={createAndRun}>
           <textarea
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            placeholder="/task task_123, /artifact implementation.mdx, or local note"
+            value={objective}
+            onChange={(event) => setObjective(event.target.value)}
+            placeholder="Describe a coding task. Midgard will create an isolated worktree and run one Codex agent."
+            aria-label="Task objective"
           />
-          <Button title="Send" type="submit">
-            <Send size={16} />
-          </Button>
+          <div className="composer-actions">
+            <Button title="Create and run task" type="submit" disabled={running || !objective.trim()}>
+              <Plus size={16} />
+              {running ? "Working…" : "Create & run"}
+            </Button>
+            <Button
+              title="Run loaded task"
+              type="button"
+              variant="ghost"
+              disabled={running || !state.status}
+              onClick={async () => {
+                setRunning(true);
+                setError("");
+                try {
+                  await runTask(taskId);
+                  await loadTask(taskId);
+                } catch (err) {
+                  await loadTask(taskId);
+                  setError(errorMessage(err));
+                } finally {
+                  setRunning(false);
+                }
+              }}
+            >
+              <Play size={16} />
+              Run loaded
+            </Button>
+          </div>
         </form>
       </section>
 
@@ -151,7 +190,18 @@ export function App() {
   );
 }
 
-function StatusPill({ status, dirtyCount }: { status: TaskStatus | null; dirtyCount: number }) {
+function StatusPill({
+  status,
+  dirtyCount,
+  running
+}: {
+  status: TaskStatus | null;
+  dirtyCount: number;
+  running: boolean;
+}) {
+  if (running) {
+    return <div className="status-pill">running · Codex</div>;
+  }
   if (!status) {
     return <div className="status-pill muted">offline</div>;
   }
@@ -160,6 +210,11 @@ function StatusPill({ status, dirtyCount }: { status: TaskStatus | null; dirtyCo
       {status.Task.State} · {status.NextAction} · dirty {dirtyCount}
     </div>
   );
+}
+
+function newTaskId(): string {
+  const stamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+  return `task_${stamp}`;
 }
 
 function errorMessage(err: unknown): string {

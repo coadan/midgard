@@ -200,7 +200,7 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		root := fs.String("root", "", "workbench root or search start")
 		id := fs.String("task", "", "task id")
 		roleName := fs.String("role", "planner", "planner, implementer, or reviewer")
-		providerName := fs.String("provider", "fake", "fake, deepseek, or codex")
+		providerName := fs.String("provider", "codex", "codex, deepseek, or fake")
 		fakeStream := fs.String("fake-stream", "", "fake provider stream file")
 		modelID := fs.String("model", "", "model id")
 		deepseekReasoningEffort := fs.String("deepseek-reasoning-effort", "", "DeepSeek reasoning effort: high or max")
@@ -246,10 +246,11 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fs.SetOutput(stderr)
 		root := fs.String("root", "", "workbench root or search start")
 		id := fs.String("task", "", "task id")
-		providerName := fs.String("provider", "fake", "fake, deepseek, or codex")
-		plannerStream := fs.String("planner-stream", "", "fake planner stream file")
+		providerName := fs.String("provider", "codex", "codex, deepseek, or fake")
+		workflow := fs.Bool("workflow", false, "run the legacy planner, implementer, and reviewer workflow")
+		plannerStream := fs.String("planner-stream", "", "fake planner stream file (implies --workflow)")
 		implementerStream := fs.String("implementer-stream", "", "fake implementer stream file")
-		reviewerStream := fs.String("reviewer-stream", "", "fake reviewer stream file")
+		reviewerStream := fs.String("reviewer-stream", "", "fake reviewer stream file (implies --workflow)")
 		modelID := fs.String("model", "", "model id")
 		deepseekReasoningEffort := fs.String("deepseek-reasoning-effort", "", "DeepSeek reasoning effort: high or max")
 		maxOutputTokens := fs.Int("max-output-tokens", 4096, "provider max output tokens")
@@ -266,24 +267,40 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		if err != nil {
 			return err
 		}
-		providers, err := loopProvidersWithOptions(*providerName, map[model.Role]string{
-			model.RolePlanner:     *plannerStream,
-			model.RoleImplementer: *implementerStream,
-			model.RoleReviewer:    *reviewerStream,
-		}, providerOptions{DeepSeekReasoningEffort: *deepseekReasoningEffort})
-		if err != nil {
-			return err
-		}
 		resolvedModelID := resolveModelID(*modelID, *providerName)
-		result, err := midgardtask.RunLoop(ctx, start, *id, midgardtask.RunnerOptions{
+		opts := midgardtask.RunnerOptions{
 			ModelID:              resolvedModelID,
-			Providers:            providers,
 			Budget:               streamBudget(*maxOutputTokens),
 			Pricing:              pricingForProvider(*providerName, resolvedModelID),
 			MaxReviewCycles:      *maxReviewCycles,
 			MaxSourceEditRepairs: *maxSourceEditRepairs,
 			MaxCommandTurns:      *maxCommandTurns,
-		})
+		}
+		runWorkflow := *workflow || *plannerStream != "" || *reviewerStream != ""
+		var result midgardtask.LoopResult
+		if runWorkflow {
+			providers, err := loopProvidersWithOptions(*providerName, map[model.Role]string{
+				model.RolePlanner:     *plannerStream,
+				model.RoleImplementer: *implementerStream,
+				model.RoleReviewer:    *reviewerStream,
+			}, providerOptions{DeepSeekReasoningEffort: *deepseekReasoningEffort})
+			if err != nil {
+				return err
+			}
+			opts.Providers = providers
+			result, err = midgardtask.RunLoop(ctx, start, *id, opts)
+		} else {
+			provider, providerErr := roleProviderWithOptions(
+				*providerName,
+				*implementerStream,
+				providerOptions{DeepSeekReasoningEffort: *deepseekReasoningEffort},
+			)
+			if providerErr != nil {
+				return providerErr
+			}
+			opts.Providers = midgardtask.RoleProviders{model.RoleImplementer: provider}
+			result, err = midgardtask.RunAgent(ctx, start, *id, opts)
+		}
 		if err != nil {
 			return err
 		}
@@ -338,7 +355,7 @@ func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "  stream  stream task events")
 	fmt.Fprintln(w, "  pr      link and inspect task pull requests")
 	fmt.Fprintln(w, "  step    advance one role")
-	fmt.Fprintln(w, "  run     run planner, implementer, and reviewer")
+	fmt.Fprintln(w, "  run     run one coding agent (use --workflow for planner/reviewer roles)")
 	fmt.Fprintln(w, "  cleanup remove task runtime files")
 }
 

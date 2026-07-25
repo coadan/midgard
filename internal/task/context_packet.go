@@ -44,6 +44,13 @@ func contextPacket(ctx context.Context, status StatusResult, layout workbench.La
 		b.WriteString(fmt.Sprintf("%t", wt.Dirty))
 		b.WriteByte('\n')
 	}
+	b.WriteString("\navailable_tools:\n")
+	b.WriteString(availableToolContext())
+	guidance := repositoryGuidance(status.Worktrees)
+	if guidance != "" {
+		b.WriteString("\nrepository_guidance:\n")
+		b.WriteString(guidance)
+	}
 	forgeDigest := forgeDigestContext(ctx, layout, status.Task.ID)
 	if forgeDigest != "" {
 		b.WriteString("\nforge_prs:\n")

@@ -15,8 +15,14 @@ reports.
 Check the implementation:
 
 ```sh
-go test ./...
-cd web && pnpm test && pnpm build
+make test
+make web
+```
+
+Install the current binary:
+
+```sh
+make install
 ```
 
 ## First Local Task
@@ -35,26 +41,22 @@ Create a task. Midgard creates an isolated Git worktree under
 go run ./cmd/midgard task create --root /path/to/workbench --id task_demo --objective "Change README"
 ```
 
-Run a fake planner step from a stream file:
+Run the task with the default Codex provider. Midgard reads the normal local
+Codex authentication and model configuration, loads each repository's root
+`AGENTS.md`, and uses one coding agent for discovery, editing, and focused
+verification:
 
 ```sh
-cat > /tmp/plan.stream <<'EOF'
-@report plan.mdx
-# Plan
-
-Update README and verify the diff.
-@result status:ready artifact:plan.mdx checks:diff-check
-EOF
-
-go run ./cmd/midgard task step --root /path/to/workbench --task task_demo --role planner --provider fake --fake-stream /tmp/plan.stream
+midgard task run --root /path/to/workbench --task task_demo
 ```
 
-Run a full fake planner, implementer, reviewer loop from stream files:
+The older multi-role workflow remains available when explicitly useful:
 
 ```sh
-go run ./cmd/midgard task run \
+midgard task run \
   --root /path/to/workbench \
   --task task_demo \
+  --workflow \
   --provider fake \
   --planner-stream /tmp/plan.stream \
   --implementer-stream /tmp/implementation.stream \
@@ -285,9 +287,18 @@ go run ./cmd/midgard benchmark report \
 Start the local API and browser UI:
 
 ```sh
-go run ./cmd/midgard serve --root /path/to/workbench --addr 127.0.0.1:8765
-go run ./cmd/midgard ui --root /path/to/workbench
+midgard serve --root /path/to/workbench --addr 127.0.0.1:8765
+midgard ui --root /path/to/workbench
 ```
+
+The browser can create an isolated task and run the default single Codex agent
+directly. If `heimdal` is on `PATH`, Midgard exposes it in the task context as
+the optional Playwright browser-QA tool; no MCP registration is required.
+
+Midgard reconstructs model context from SQLite task state, Git worktrees, and
+artifacts instead of replaying an ever-growing chat transcript. See
+[Context and Compaction](docs/context-compaction.md) for the active-context and
+long-task checkpoint design.
 
 ## Provider Notes
 

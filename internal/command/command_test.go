@@ -100,10 +100,11 @@ func TestExecutorTimeoutAndOutputCap(t *testing.T) {
 	executor := NewExecutor(commandPolicy)
 
 	result, err := executor.Run(ctx, Request{
-		ID:          "cmd_timeout",
-		Command:     "printf 1234567890; sleep 1",
-		CWD:         repo,
-		ArtifactDir: artifactDir,
+		ID:                 "cmd_timeout",
+		Command:            "printf 1234567890; sleep 1",
+		CWD:                repo,
+		ArtifactDir:        artifactDir,
+		PreserveFullOutput: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -115,8 +116,11 @@ func TestExecutorTimeoutAndOutputCap(t *testing.T) {
 		t.Fatal("stdout should be truncated")
 	}
 	stdout := readArtifact(t, artifactDir, result.StdoutPath)
-	if stdout != "1234" {
-		t.Fatalf("stdout = %q, want capped output", stdout)
+	if stdout != "1234567890" {
+		t.Fatalf("stdout = %q, want lossless artifact output", stdout)
+	}
+	if result.StdoutBytes != 10 {
+		t.Fatalf("stdout bytes = %d, want 10", result.StdoutBytes)
 	}
 }
 
