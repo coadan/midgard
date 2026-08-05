@@ -50,6 +50,14 @@ The product is the harness and evidence trail, not the chat UI alone.
 - Use `apply_patch` for manual file edits.
 - Do not print secrets from `.env` or copied provider config.
 - Do not commit local runtime state, worktrees, generated artifacts, or reports.
+- When Ygg is available, start code discovery with
+  `ygg search "<behavior or owner>" [path]`. Default `auto` combines lexical and
+  configured semantic recall. Use `-F` for a fixed symbol/string or `-E` for a
+  Go regexp, and add `--about "<intent>"` when the exact pattern should retain
+  semantic meaning. Use `--mode lexical` for deterministic presence/absence.
+  Read citations from `data.records` and the resolved plan from
+  `data.queryPlan`; `fallbackReason: "index-busy"` means results came from a
+  live working-tree scan and does not require a retry.
 
 ## Planned Layout
 
