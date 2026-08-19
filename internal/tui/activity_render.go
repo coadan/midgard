@@ -136,12 +136,18 @@ func repositorySearchRecovery(code string) string {
 	switch code {
 	case "search_unavailable":
 		return "Bundled repository search is unavailable. Reinstall Midgard to restore it."
+	case "search_setup_failed":
+		return "Midgard could not prepare its private search index. Reinstall Midgard, then try again."
+	case "search_invalid_result":
+		return "The bundled search companion is out of sync. Reinstall Midgard to restore the matching pair."
+	case "search_failed":
+		return "Local repository search stopped before returning results. Try again; if it keeps happening, reinstall Midgard."
 	case "search_timeout":
 		return "Search took too long. Try a narrower path or query."
 	case "invalid_path":
 		return "That path is not available in this worktree. Choose a current relative path."
 	default:
-		return "Search could not finish. Try a narrower path or query."
+		return "Search could not finish. Try again, or reinstall Midgard if it keeps happening."
 	}
 }
 

@@ -32,7 +32,7 @@ func TestResolveCompanionRequiresMatchingPinnedManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := `{"schema":"midgard.companion/v1","name":"ygg","module":"github.com/coadan/yggdrasil","version":"v0.3.0","sum":"h1:test","binary_sha256":"` + digest + `"}`
+	manifest := `{"schema":"midgard.companion/v1","name":"ygg","module":"github.com/coadan/yggdrasil","version":"` + YggdrasilVersion + `","sum":"h1:test","binary_sha256":"` + digest + `"}`
 	if err := os.WriteFile(ygg+".manifest.json", []byte(manifest), 0o600); err != nil {
 		t.Fatal(err)
 	}

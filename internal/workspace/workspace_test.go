@@ -780,10 +780,17 @@ func createRepository(t *testing.T) string {
 func writeYggFixture(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "ygg")
-	script := `#!/bin/sh
+script := `#!/bin/sh
 if [ -z "$YGG_STORAGE_ROOT" ] || [ -z "$YGG_CONFIG" ] || [ ! -f "$YGG_CONFIG" ]; then
   exit 9
 fi
+case " $* " in
+  *" --fixed-strings "*) ;;
+  *)
+    printf '%s\n' '{"schema":"ygg.cli/v1","ok":false,"error":{"message":"expected fixed-string search"}}'
+    exit 2
+    ;;
+esac
 case "$*" in
   *"not present anywhere"*)
     printf '%s\n' '{"schema":"ygg.cli/v1","ok":true,"data":{"schema":"ygg.search.result/v4","activeMode":"lexical","records":[]}}'

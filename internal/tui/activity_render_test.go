@@ -111,6 +111,19 @@ func TestUnavailableRepositorySearchShowsReinstallRecovery(t *testing.T) {
 	}
 }
 
+func TestFailedRepositorySearchDoesNotSuggestNarrowing(t *testing.T) {
+	var output strings.Builder
+	card := &ToolCard{Name: "repo_search", State: "failed", Arguments: `{"query":"needle"}`,
+		Output: `{"exit_code":2,"error_code":"search_failed"}`}
+	if !renderCompletedActivity(&output, card, 100) {
+		t.Fatal("repository search failure was not rendered")
+	}
+	got := output.String()
+	if !strings.Contains(got, "reinstall Midgard") || strings.Contains(got, "narrower") {
+		t.Fatalf("repository search failure recovery = %s", got)
+	}
+}
+
 func TestInvalidSkillReadShowsNotRunRecovery(t *testing.T) {
 	card := &ToolCard{Name: "skill_read", State: "invalid", Arguments: `{}`, Output: `{"error":"skill_read needs arguments.name. Nothing was run"}`}
 	var output strings.Builder

@@ -15,7 +15,7 @@ const (
 	// YggdrasilModule is built as a separate executable because its public
 	// contract is its versioned CLI JSON envelope, not Go package imports.
 	YggdrasilModule  = "github.com/coadan/yggdrasil"
-	YggdrasilVersion = "v0.3.0"
+	YggdrasilVersion = "v0.4.0"
 	HeimdalModule    = "github.com/coadan/heimdal"
 	HeimdalVersion   = "v0.0.0-20260803075142-786747acf5c4"
 

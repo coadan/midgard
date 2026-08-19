@@ -351,7 +351,7 @@ func searchRepository(ctx context.Context, yggBinary, storageRoot string, config
 		if errors.Is(searchContext.Err(), context.DeadlineExceeded) {
 			return Output{Stderr: "Repository search took too long. Try a narrower path or query.", ExitCode: -1, ErrorCode: "search_timeout", Truncated: raw.Truncated}, searchContext.Err()
 		}
-		return Output{Stderr: "Repository search could not finish. Try a narrower path or query.", ExitCode: raw.ExitCode, ErrorCode: "search_failed", Truncated: raw.Truncated}, err
+		return Output{Stderr: "Local repository search stopped before returning results. Try again; if it keeps happening, reinstall Midgard.", ExitCode: raw.ExitCode, ErrorCode: "search_failed", Truncated: raw.Truncated}, err
 	}
 	result, err := parseYggSearch(raw.Stdout, root, mode)
 	if err != nil {

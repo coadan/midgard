@@ -32,5 +32,5 @@ build_companion() {
     "$name" "$module" "$version" "$module_sum" "$binary_sum" > "$output/libexec/$name.manifest.json"
 }
 
-build_companion ygg github.com/coadan/yggdrasil v0.3.0
+build_companion ygg github.com/coadan/yggdrasil v0.4.0
 build_companion heimdal github.com/coadan/heimdal v0.0.0-20260803075142-786747acf5c4
