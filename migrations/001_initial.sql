@@ -1,131 +1,116 @@
-CREATE TABLE IF NOT EXISTS workbenches (
-  id TEXT PRIMARY KEY,
-  root TEXT NOT NULL UNIQUE,
-  config_path TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS repos (
-  id TEXT PRIMARY KEY,
-  workbench_id TEXT NOT NULL,
-  path TEXT NOT NULL,
-  main_ref TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (workbench_id) REFERENCES workbenches(id)
-);
-
-CREATE TABLE IF NOT EXISTS tasks (
-  id TEXT PRIMARY KEY,
-  workbench_id TEXT NOT NULL,
-  state TEXT NOT NULL,
-  objective TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (workbench_id) REFERENCES workbenches(id)
-);
-
-CREATE TABLE IF NOT EXISTS task_repos (
-  task_id TEXT NOT NULL,
-  repo_id TEXT NOT NULL,
-  PRIMARY KEY (task_id, repo_id),
-  FOREIGN KEY (task_id) REFERENCES tasks(id),
-  FOREIGN KEY (repo_id) REFERENCES repos(id)
-);
-
-CREATE TABLE IF NOT EXISTS worktrees (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  repo_id TEXT NOT NULL,
-  path TEXT NOT NULL,
-  start_ref TEXT NOT NULL,
-  start_commit TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (task_id) REFERENCES tasks(id),
-  FOREIGN KEY (repo_id) REFERENCES repos(id)
-);
-
-CREATE TABLE IF NOT EXISTS leases (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  state TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  expires_at TEXT,
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
+CREATE TABLE IF NOT EXISTS session_heads (
+  session_id TEXT PRIMARY KEY,
+  sequence INTEGER NOT NULL DEFAULT 0 CHECK (sequence >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id TEXT,
-  type TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  event_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK (sequence > 0),
+  turn_id TEXT,
+  actor TEXT NOT NULL CHECK (actor IN ('user', 'model', 'server', 'tool', 'policy')),
+  kind TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+  causation_id TEXT,
+  correlation_id TEXT,
+  visibility TEXT NOT NULL CHECK (visibility IN ('public', 'internal', 'secret')),
+  payload_json BLOB,
+  artifact_ref TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE (session_id, sequence),
+  FOREIGN KEY (session_id) REFERENCES session_heads(session_id)
 );
 
-CREATE TABLE IF NOT EXISTS artifacts (
-  id TEXT PRIMARY KEY,
-  task_id TEXT,
-  type TEXT NOT NULL,
-  path TEXT NOT NULL,
-  checksum TEXT,
-  producer_role TEXT,
-  state TEXT NOT NULL DEFAULT 'sealed',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE INDEX IF NOT EXISTS events_session_kind
+  ON events(session_id, kind, sequence);
+
+CREATE TABLE IF NOT EXISTS session_projection (
+  session_id TEXT PRIMARY KEY,
+  objective TEXT NOT NULL,
+  status TEXT NOT NULL,
+  last_sequence INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS streams (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  raw_artifact_id TEXT,
-  parser_version TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
+CREATE TABLE IF NOT EXISTS message_projection (
+  message_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+  content TEXT NOT NULL,
+  artifact_ref TEXT,
+  sequence INTEGER NOT NULL,
+  UNIQUE (session_id, sequence),
+  FOREIGN KEY (session_id) REFERENCES session_heads(session_id),
+  FOREIGN KEY (turn_id) REFERENCES turn_projection(turn_id)
 );
 
-CREATE TABLE IF NOT EXISTS parser_errors (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  stream_id TEXT NOT NULL,
-  code TEXT NOT NULL,
-  message TEXT NOT NULL,
-  source_range TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (stream_id) REFERENCES streams(id)
+CREATE TABLE IF NOT EXISTS turn_projection (
+  turn_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_sequence INTEGER NOT NULL,
+  ended_sequence INTEGER,
+  FOREIGN KEY (session_id) REFERENCES session_heads(session_id)
 );
 
-CREATE TABLE IF NOT EXISTS repair_attempts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  stream_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  attempt INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS control_projection (
+  control_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  acknowledged INTEGER NOT NULL DEFAULT 0,
+  sequence INTEGER NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES session_heads(session_id)
+);
+
+CREATE TABLE IF NOT EXISTS action_projection (
+  action_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
   state TEXT NOT NULL,
-  error_codes TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (stream_id) REFERENCES streams(id)
+  version INTEGER NOT NULL,
+  capability TEXT NOT NULL,
+  arguments_json BLOB NOT NULL,
+  approval_required INTEGER NOT NULL DEFAULT 0,
+  approved INTEGER NOT NULL DEFAULT 0,
+  commit_id TEXT UNIQUE,
+  idempotency_key TEXT,
+  dispatch_owner TEXT,
+  dispatch_fence INTEGER,
+  compensation_action_id TEXT,
+  result_json BLOB,
+  last_sequence INTEGER NOT NULL,
+  UNIQUE (session_id, idempotency_key),
+  FOREIGN KEY (session_id) REFERENCES session_heads(session_id)
 );
 
-CREATE TABLE IF NOT EXISTS providers (
-  id TEXT PRIMARY KEY,
-  family TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS approval_projection (
+  action_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  decided_by TEXT,
+  decision_sequence INTEGER,
+  FOREIGN KEY (action_id) REFERENCES action_projection(action_id)
 );
 
-CREATE TABLE IF NOT EXISTS usage_records (
-  id TEXT PRIMARY KEY,
-  task_id TEXT,
-  provider_id TEXT NOT NULL,
-  model_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  input_tokens INTEGER NOT NULL DEFAULT 0,
-  output_tokens INTEGER NOT NULL DEFAULT 0,
-  raw_payload TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS workspace_projection (
+  session_id TEXT PRIMARY KEY,
+  repository_root TEXT NOT NULL,
+  worktree_root TEXT NOT NULL,
+  start_commit TEXT NOT NULL,
+  last_sequence INTEGER NOT NULL,
+  FOREIGN KEY (session_id) REFERENCES session_heads(session_id)
 );
 
-CREATE TABLE IF NOT EXISTS cost_rollups (
-  id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL,
-  amount_usd TEXT NOT NULL,
-  caveats TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS completion_evidence_projection (
+  session_id TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  artifact_ref TEXT,
+  payload_json BLOB,
+  sequence INTEGER NOT NULL,
+  PRIMARY KEY (session_id, evidence_id),
+  FOREIGN KEY (session_id) REFERENCES session_heads(session_id)
 );

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://midgard.local/schemas/event-envelope.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "session_id", "sequence", "actor", "kind", "schema_version", "visibility", "created_at"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 1},
+    "turn_id": {"type": ["string", "null"]},
+    "actor": {"enum": ["user", "model", "server", "tool", "policy"]},
+    "kind": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"},
+    "schema_version": {"type": "integer", "minimum": 1},
+    "causation_id": {"type": ["string", "null"]},
+    "correlation_id": {"type": ["string", "null"]},
+    "visibility": {"enum": ["public", "internal", "secret"]},
+    "payload_json": {},
+    "artifact_ref": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}
+

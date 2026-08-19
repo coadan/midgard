@@ -1,0 +1,5 @@
++ @t1 tool
++ @t1.name "shell"
++ @t1.arguments.command "pwd"
++ @t1.reason "Inspect the worktree"
+! @t1

@@ -1,0 +1,4 @@
++ @t1 tool
++ @t1.name "shell"
++ @t1.arguments.command "pwd"
++ @t1.reason "This draft must not execute"

@@ -1,25 +1,10 @@
-.env
-.env.*
+/\.midgard2/
+/\.midgard/
+/.env
+/.env.*
+!/.env.example
+/midgard2
+/midgard
+/protocol-report.json
+*.out
 .DS_Store
-node_modules/
-*.tsbuildinfo
-
-# Local planning and reports
-.dev/
-
-# Go/build output
-bin/
-dist/
-!internal/webassets/dist/
-!internal/webassets/dist/**
-coverage.out
-
-# Local Midgard runtime state
-.midgard/
-.midgard/state.sqlite
-.midgard/state.sqlite-*
-.midgard/worktrees/
-.midgard/artifacts/
-
-# Local Heimdal browser sessions and evidence
-.heimdal/

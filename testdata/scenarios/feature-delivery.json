@@ -1,0 +1,11 @@
+{
+  "policy": "feature-delivery/v1",
+  "scenarios": [
+    {"name":"verified-no-op","expects_completion":true,"canonical_source":"git"},
+    {"name":"focused-edit","files_changed":1,"expects_completion":true},
+    {"name":"multi-file-edit","files_changed":2,"expects_completion":true},
+    {"name":"failed-check","expects_completion":false},
+    {"name":"cancellation","expects_new_actions":false}
+  ]
+}
+

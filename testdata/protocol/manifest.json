@@ -1,0 +1,8 @@
+{
+  "cases": [
+    {"name":"committed-tool","input":"committed_tool.bragi","expected_actions":1,"expected_name":"shell","expected_arguments":{"command":"pwd"}},
+    {"name":"repaired-tool","input":"repaired_tool.bragi","expected_actions":1,"expected_name":"shell","expected_arguments":{"command":"go test ./..."}},
+    {"name":"draft-has-no-effect","input":"draft_tool.bragi","expected_actions":0},
+    {"name":"invalid-commit-has-no-effect","input":"invalid_commit.bragi","expected_actions":0,"expected_rejections":1}
+  ]
+}

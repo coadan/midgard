@@ -1,0 +1,6 @@
+/bragi-check
+*.out
+/.env
+/.env.*
+!/.env.example
+.DS_Store

@@ -1,0 +1,6 @@
++ @t1 tool
++ @t1.name "shell"
++ @t1.arguments.command "go test"
+~ @t1.arguments.command "go test ./..."
++ @t1.reason "Run the full test suite"
+! @t1

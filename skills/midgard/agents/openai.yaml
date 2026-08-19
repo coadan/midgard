@@ -1,0 +1,4 @@
+interface:
+  display_name: "Midgard"
+  short_description: "Operate and extend the Midgard coding-agent runtime"
+  default_prompt: "Use $midgard to operate or modify Midgard safely."

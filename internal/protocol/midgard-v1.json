@@ -1,0 +1,156 @@
+{
+  "protocol": "bragi/1.0",
+  "name": "midgard",
+  "version": "1.0",
+  "limits": {
+    "max_line_bytes": 16384,
+    "max_literal_bytes": 262144,
+    "max_entities": 1000,
+    "max_records": 10000
+  },
+  "types": {
+    "message": {
+      "mutation": "revisioned",
+      "effect": "none",
+      "required": ["speaker", "audience", "channel", "content"],
+      "publication_guards": ["speaker", "audience", "channel"],
+      "field_order": ["speaker", "audience", "channel", "content"],
+      "fields": {
+        "speaker": {"kinds": ["string"], "cardinality": "scalar"},
+        "audience": {"kinds": ["string"], "cardinality": "scalar"},
+        "channel": {"kinds": ["string"], "cardinality": "scalar"},
+        "content": {"kinds": ["string"], "cardinality": "scalar", "literal": true}
+      }
+    },
+    "artifact": {
+      "mutation": "revisioned",
+      "effect": "none",
+      "required": ["kind", "path", "media", "content"],
+      "field_order": ["kind", "path", "media", "content", "depends_on"],
+      "fields": {
+        "kind": {"kinds": ["string"], "cardinality": "scalar"},
+        "path": {"kinds": ["string"], "cardinality": "scalar"},
+        "media": {"kinds": ["string"], "cardinality": "scalar"},
+        "content": {"kinds": ["string"], "cardinality": "scalar", "literal": true},
+        "depends_on": {"kinds": ["ref"], "cardinality": "collection"}
+      }
+    },
+    "tool": {
+      "mutation": "immutable",
+      "effect": "host-action",
+      "required": ["name", "reason"],
+      "field_order": ["name", "arguments.*", "reason", "inputs", "supersedes"],
+      "fields": {
+        "name": {"kinds": ["string"], "cardinality": "scalar"},
+        "arguments.*": {"kinds": ["string", "number", "bool", "null", "ref"], "cardinality": "scalar", "literal": true},
+        "reason": {"kinds": ["string"], "cardinality": "scalar"},
+        "inputs": {"kinds": ["ref"], "cardinality": "collection"},
+        "supersedes": {"kinds": ["ref"], "cardinality": "scalar"}
+      }
+    },
+    "plan_step": {
+      "mutation": "revisioned",
+      "effect": "none",
+      "required": ["intent", "acceptance", "status"],
+      "field_order": ["intent", "acceptance", "depends_on", "risk", "status"],
+      "fields": {
+        "intent": {"kinds": ["string"], "cardinality": "scalar"},
+        "acceptance": {"kinds": ["string"], "cardinality": "scalar"},
+        "depends_on": {"kinds": ["ref"], "cardinality": "collection"},
+        "risk": {"kinds": ["string"], "cardinality": "scalar"},
+        "status": {"kinds": ["string"], "cardinality": "scalar"}
+      }
+    },
+    "finding": {
+      "mutation": "revisioned",
+      "effect": "none",
+      "required": ["severity", "claim", "evidence", "status"],
+      "field_order": ["severity", "claim", "evidence", "target", "status"],
+      "fields": {
+        "severity": {"kinds": ["string"], "cardinality": "scalar"},
+        "claim": {"kinds": ["string"], "cardinality": "scalar"},
+        "evidence": {"kinds": ["string", "ref"], "cardinality": "scalar", "literal": true},
+        "target": {"kinds": ["ref"], "cardinality": "scalar"},
+        "status": {"kinds": ["string"], "cardinality": "scalar"}
+      }
+    },
+    "commit_unit": {
+      "mutation": "revisioned",
+      "effect": "none",
+      "required": ["intent"],
+      "field_order": ["intent", "plan_steps", "changes", "checks", "findings", "comprehension"],
+      "fields": {
+        "intent": {"kinds": ["string"], "cardinality": "scalar"},
+        "plan_steps": {"kinds": ["ref"], "cardinality": "collection"},
+        "changes": {"kinds": ["ref"], "cardinality": "collection"},
+        "checks": {"kinds": ["ref"], "cardinality": "collection"},
+        "findings": {"kinds": ["ref"], "cardinality": "collection"},
+        "comprehension": {"kinds": ["ref"], "cardinality": "scalar"}
+      }
+    },
+    "comprehension": {
+      "mutation": "revisioned",
+      "effect": "none",
+      "required": ["change", "why", "boundary_delta", "new_invariants", "verification", "maintainer_model"],
+      "field_order": ["change", "why", "boundary_delta", "new_invariants", "verification", "maintainer_model", "references"],
+      "fields": {
+        "change": {"kinds": ["string"], "cardinality": "scalar"},
+        "why": {"kinds": ["string"], "cardinality": "scalar"},
+        "boundary_delta": {"kinds": ["string"], "cardinality": "scalar"},
+        "new_invariants": {"kinds": ["string"], "cardinality": "scalar"},
+        "verification": {"kinds": ["string"], "cardinality": "scalar"},
+        "maintainer_model": {"kinds": ["string"], "cardinality": "scalar"},
+        "references": {"kinds": ["ref"], "cardinality": "collection"}
+      }
+    },
+    "option": {
+      "mutation": "revisioned",
+      "effect": "none",
+      "required": ["label", "description", "recommended"],
+      "field_order": ["label", "description", "recommended"],
+      "fields": {
+        "label": {"kinds": ["string"], "cardinality": "scalar"},
+        "description": {"kinds": ["string"], "cardinality": "scalar"},
+        "recommended": {"kinds": ["bool"], "cardinality": "scalar"}
+      }
+    },
+    "question": {
+      "mutation": "immutable",
+      "effect": "human-question",
+      "required": ["question", "why_blocking", "scope_impact"],
+      "field_order": ["question", "why_blocking", "options", "scope_impact"],
+      "fields": {
+        "question": {"kinds": ["string"], "cardinality": "scalar"},
+        "why_blocking": {"kinds": ["string"], "cardinality": "scalar"},
+        "options": {"kinds": ["ref"], "cardinality": "collection"},
+        "scope_impact": {"kinds": ["string"], "cardinality": "scalar"}
+      }
+    },
+    "check": {
+      "mutation": "revisioned",
+      "effect": "none",
+      "required": ["name", "status", "evidence"],
+      "field_order": ["name", "status", "evidence"],
+      "fields": {
+        "name": {"kinds": ["string"], "cardinality": "scalar"},
+        "status": {"kinds": ["string"], "cardinality": "scalar"},
+        "evidence": {"kinds": ["string", "ref"], "cardinality": "scalar", "literal": true}
+      }
+    },
+    "completion": {
+      "mutation": "immutable",
+      "effect": "completion-proposal",
+      "required": ["requested_outcome"],
+      "field_order": ["requested_outcome", "plan_steps", "checks", "findings", "effects", "deliverables", "known_issues"],
+      "fields": {
+        "requested_outcome": {"kinds": ["string"], "cardinality": "scalar"},
+        "plan_steps": {"kinds": ["ref"], "cardinality": "collection"},
+        "checks": {"kinds": ["ref"], "cardinality": "collection"},
+        "findings": {"kinds": ["ref"], "cardinality": "collection"},
+        "effects": {"kinds": ["ref"], "cardinality": "collection"},
+        "deliverables": {"kinds": ["ref"], "cardinality": "collection"},
+        "known_issues": {"kinds": ["ref"], "cardinality": "collection"}
+      }
+    }
+  }
+}

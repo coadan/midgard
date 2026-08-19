@@ -3,139 +3,167 @@ package artifact
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-type Store struct {
-	Root string
+type Store struct{ root string }
+
+type Artifact struct {
+	Ref  string
+	Path string
+	Size int64
 }
 
-func NewStore(root string) Store {
-	return Store{Root: root}
-}
-
-func (s Store) Put(record Record, data []byte) (Record, error) {
-	path, err := s.Resolve(record.Path)
-	if err != nil {
-		return record, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return record, err
-	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return record, err
-	}
-	record.Size = int64(len(data))
-	if record.State == StateSealed {
-		sum := sha256.Sum256(data)
-		record.Checksum = "sha256:" + hex.EncodeToString(sum[:])
-	}
-	return record, nil
-}
-
-func (s Store) PutFile(record Record, source string) (Record, error) {
-	path, err := s.Resolve(record.Path)
-	if err != nil {
-		return record, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return record, err
-	}
-	file, err := os.Open(source)
-	if err != nil {
-		return record, err
-	}
-	hash := sha256.New()
-	size, copyErr := io.Copy(hash, file)
-	closeErr := file.Close()
-	if copyErr != nil {
-		return record, copyErr
-	}
-	if closeErr != nil {
-		return record, closeErr
-	}
-	if err := os.Rename(source, path); err != nil {
-		return record, err
-	}
-	record.Size = size
-	if record.State == StateSealed {
-		record.Checksum = "sha256:" + hex.EncodeToString(hash.Sum(nil))
-	}
-	return record, nil
-}
-
-func (s Store) Read(path string) ([]byte, error) {
-	resolved, err := s.Resolve(path)
+func Open(root string) (*Store, error) {
+	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(resolved)
+	if err := os.MkdirAll(filepath.Join(abs, "sha256"), 0o700); err != nil {
+		return nil, err
+	}
+	return &Store{root: abs}, nil
 }
 
-func (s Store) ReadHeadTail(path string, limit int64) (head, tail []byte, size int64, err error) {
-	resolved, err := s.Resolve(path)
+func (s *Store) Put(reader io.Reader) (Artifact, error) {
+	w, err := s.NewWriter()
 	if err != nil {
-		return nil, nil, 0, err
+		return Artifact{}, err
 	}
-	file, err := os.Open(resolved)
+	if _, err := io.Copy(w, reader); err != nil {
+		w.Abort()
+		return Artifact{}, err
+	}
+	return w.Seal()
+}
+
+type Writer struct {
+	store  *Store
+	file   *os.File
+	hash   hash.Hash
+	size   int64
+	closed bool
+}
+
+func (s *Store) NewWriter() (*Writer, error) {
+	file, err := os.CreateTemp(s.root, ".unsealed-*")
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		os.Remove(file.Name())
+		return nil, err
+	}
+	return &Writer{store: s, file: file, hash: sha256.New()}, nil
+}
+
+func (w *Writer) Write(data []byte) (int, error) {
+	if w.closed {
+		return 0, errors.New("artifact writer is closed")
+	}
+	n, err := w.file.Write(data)
+	if n > 0 {
+		_, _ = w.hash.Write(data[:n])
+		w.size += int64(n)
+	}
+	return n, err
+}
+
+func (w *Writer) Seal() (Artifact, error) {
+	if w.closed {
+		return Artifact{}, errors.New("artifact writer is closed")
+	}
+	w.closed = true
+	if err := w.file.Sync(); err != nil {
+		w.abortClosed()
+		return Artifact{}, err
+	}
+	if err := w.file.Close(); err != nil {
+		os.Remove(w.file.Name())
+		return Artifact{}, err
+	}
+	digest := hex.EncodeToString(w.hash.Sum(nil))
+	dir := filepath.Join(w.store.root, "sha256", digest[:2])
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		os.Remove(w.file.Name())
+		return Artifact{}, err
+	}
+	target := filepath.Join(dir, digest[2:])
+	if err := os.Link(w.file.Name(), target); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			os.Remove(w.file.Name())
+			return Artifact{}, err
+		}
+		info, statErr := os.Stat(target)
+		if statErr != nil || info.Size() != w.size {
+			os.Remove(w.file.Name())
+			return Artifact{}, fmt.Errorf("existing artifact does not match content length")
+		}
+	}
+	os.Remove(w.file.Name())
+	if err := os.Chmod(target, 0o400); err != nil {
+		return Artifact{}, err
+	}
+	return Artifact{Ref: "sha256:" + digest, Path: target, Size: w.size}, nil
+}
+
+func (w *Writer) Abort() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	return w.abortClosed()
+}
+
+func (w *Writer) abortClosed() error {
+	name := w.file.Name()
+	err := w.file.Close()
+	removeErr := os.Remove(name)
+	if err != nil {
+		return err
+	}
+	return removeErr
+}
+
+func (s *Store) Open(ref string) (*os.File, error) {
+	path, err := s.Path(ref)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(path)
+}
+
+func (s *Store) Path(ref string) (string, error) {
+	if len(ref) != len("sha256:")+64 || !strings.HasPrefix(ref, "sha256:") {
+		return "", errors.New("invalid artifact reference")
+	}
+	digest := strings.TrimPrefix(ref, "sha256:")
+	if _, err := hex.DecodeString(digest); err != nil || strings.ToLower(digest) != digest {
+		return "", errors.New("invalid artifact digest")
+	}
+	return filepath.Join(s.root, "sha256", digest[:2], digest[2:]), nil
+}
+
+func (s *Store) Verify(ref string) error {
+	file, err := s.Open(ref)
+	if err != nil {
+		return err
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, nil, 0, err
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return err
 	}
-	size = info.Size()
-	if limit <= 0 {
-		return nil, nil, size, nil
-	}
-	if size <= limit {
-		data, err := io.ReadAll(file)
-		return data, nil, size, err
-	}
-	headSize := limit * 2 / 3
-	tailSize := limit - headSize
-	head = make([]byte, headSize)
-	if _, err := io.ReadFull(file, head); err != nil {
-		return nil, nil, size, err
-	}
-	if _, err := file.Seek(-tailSize, io.SeekEnd); err != nil {
-		return nil, nil, size, err
-	}
-	tail = make([]byte, tailSize)
-	if _, err := io.ReadFull(file, tail); err != nil {
-		return nil, nil, size, err
-	}
-	return head, tail, size, nil
-}
-
-func (s Store) Resolve(path string) (string, error) {
-	if err := ValidatePath(path); err != nil {
-		return "", err
-	}
-	return filepath.Join(s.Root, filepath.FromSlash(path)), nil
-}
-
-func ValidatePath(path string) error {
-	if path == "" {
-		return fmt.Errorf("artifact path is empty")
-	}
-	if filepath.IsAbs(path) {
-		return fmt.Errorf("artifact path %q is absolute", path)
-	}
-	clean := filepath.ToSlash(filepath.Clean(path))
-	if clean == "." || clean != path {
-		return fmt.Errorf("artifact path %q is not clean", path)
-	}
-	for _, part := range strings.Split(clean, "/") {
-		if part == ".." {
-			return fmt.Errorf("artifact path %q escapes artifact root", path)
-		}
+	want := strings.TrimPrefix(ref, "sha256:")
+	if got := hex.EncodeToString(digest.Sum(nil)); got != want {
+		return fmt.Errorf("artifact checksum mismatch: got %s", got)
 	}
 	return nil
 }
