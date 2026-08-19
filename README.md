@@ -1,75 +1,142 @@
-# Midgard 2
+<p align="center">
+  <img src="assets/midgard-logo.png" alt="Midgard" width="360">
+</p>
 
-Midgard 2 is a thin, event-sourced session and safe-action kernel for coding
-agents. Sessions, turns, canonical events, immutable artifacts, workspace
-bindings, actions, and completion evidence are durable kernel concepts. Bragi
-is the model protocol at the provider/action boundary; tasks, roles, workflow
-DSLs, and live transport choices are not kernel concepts.
+# Midgard
 
-The repository currently implements the accepted reversible foundation:
+**Keep local coding agents observable, steerable, and accountable.**
 
-- the Bragi 1.0 decoder and reference materializer, with a pinned Midgard
-  profile and conformance scorer;
-- an ordered SQLite event log with optimistic sequence fencing and rebuildable
-  domain projections;
-- a content-addressed immutable artifact store and provider-native trace
-  recorder;
-- a durable action state machine that commits before dispatch and fences stale
-  workers;
-- Git worktree and bounded command primitives;
-- one Go-defined `feature-delivery` policy and deterministic context assembly;
-- a local headless `midgard` agent composition with durable messages, a
-  DeepSeek V4 Pro adapter, evidence-gated completion, and an explicit unsafe
-  local executor;
-- an attached terminal chat with safe-boundary steering, multi-turn worktrees,
-  resumable sessions, tool cards, and diff/check review;
-- rootless logical projects that give one or more independently located Git
-  repositories stable names and durable identities.
+Midgard is a local coding-agent harness with durable sessions, controlled tool
+use, and evidence-gated completion. It gives an agent a disposable Git
+worktree, lets you watch and steer the work in a terminal chat, and retains the
+evidence needed to understand what happened after a turn ends.
 
-The server, remote client/transport, workflow DSL, snapshots, distributed
-workers, custom-model training, and production containment are intentionally
-deferred behind the gates in
-[`docs/decisions/0001-session-kernel.md`](docs/decisions/0001-session-kernel.md).
+An agent can inspect code, search a repository, edit files, run checks, and
+explain its result. Midgard keeps the boundary between those steps explicit: a
+model may propose work, but Midgard validates, commits, dispatches, and records
+the result before it treats any side effect or completion claim as trustworthy.
 
-## Build and verify
+> **Status:** Midgard is an experimental local prototype. It has a working
+> coding-chat vertical, but its current executor runs agent-authored commands directly
+> on the host. It is not a sandbox, a multi-user service, or safe for untrusted
+> repositories or credentials.
+
+## A coding turn, made inspectable
+
+Imagine asking Midgard to add a feature to an existing repository:
 
 ```sh
-go test ./...
-go test -race ./...
-go run ./cmd/midgard protocol-score -manifest testdata/protocol/manifest.json
+midgard -repo /path/to/repository \
+  "add durable persistence with restart tests"
 ```
 
-`protocol-score` verifies Bragi decoding, draft repair, rejection, commit, and
-host-effect extraction against the pinned profile. Provider-native observations
-remain trace evidence and never become action intent.
+Midgard opens a session in a disposable worktree. While the agent works, the
+terminal chat shows compact progress: what it explored, commands it ran, files
+it changed, checks that passed or failed, and the final explanation. You can
+queue follow-up guidance, stop at a safe boundary, return later, or review the
+resulting diff without losing the durable record of the turn.
 
-## Local prototype safety boundary
+Under the hood, an objective follows this route:
 
-The user-facing executable is `midgard`. Store a provider key once in the
-operating system keyring, either through a no-echo prompt or by migrating an
-existing environment variable:
+```mermaid
+flowchart LR
+    U["Your objective"] --> S["Durable session"]
+    S --> P["Bragi model output"]
+    P --> A["Validated, committed action"]
+    A --> W["Fenced worktree execution"]
+    W --> E["Git and check evidence"]
+    E --> R["Evidence-gated response"]
+```
+
+The model can revise a draft request while generating. Only an accepted Bragi
+host-action proposal reaches Midgard's action lifecycle, and no external command
+runs before its exact intent is durably committed and dispatched. A final model
+message is not enough to finish the turn: Midgard evaluates server-owned Git and
+check evidence first.
+
+## Why Midgard exists
+
+Coding agents are useful only when their work remains understandable and
+recoverable. A long text transcript alone does not answer practical questions:
+
+- What did the agent actually run?
+- Which files changed, and in which worktree?
+- Did the requested check pass?
+- What was still in flight when the terminal closed?
+- Can a follow-up continue safely from the same work?
+
+Midgard makes those answers part of the runtime rather than an afterthought.
+
+| Concern | What Midgard keeps durable |
+| --- | --- |
+| Conversation | Sessions, turns, user messages, assistant responses, steering, and interruption notices. |
+| Intent and effects | Versioned action intent, validation, commit, worker fence, dispatch, and server-authored result. |
+| Model behavior | Credential-free native request/response traces, usage, and replay state as immutable artifacts. |
+| Source state | A session-owned Git worktree, bounded edits, diffs, and repository check evidence. |
+| Runtime configuration | Named environment revisions and provider/profile provenance—never secret values in prompts, state, artifacts, or the TUI. |
+
+This is deliberately narrower than an autonomous development platform. Midgard
+does not make a planner, a workflow language, or a model response the source of
+truth. It is the small control layer around a coding turn.
+
+## Start locally
+
+Clone the repository, build from its root, and authenticate a provider once:
 
 ```sh
+go install ./cmd/midgard
 midgard auth login deepseek
-midgard auth login deepseek --profile work --from-env DEEPSEEK_API_KEY
-midgard auth status deepseek --profile work
-codex login
 ```
 
-Profiles mount independent keys for the same provider. Select one with
-`-profile work`; `default` is used when no profile is specified. Runtime
-credential lookup uses only the OS keyring. Environment variables are accepted
-only by the explicit `auth login --from-env` migration command. Secrets are
-never written to Midgard config, state, artifacts, or worktrees.
-The TUI's `/auth` interface can launch either flow. `/model` lists DeepSeek and
-the models advertised by the installed Codex app-server; local Codex login
-material remains owned by Codex and is never imported into Midgard.
+Then open the current Git repository's session home:
 
-### Runtime environments
+```sh
+midgard
+```
 
-Named runtime environments replace duplicated project `.env` files while
-allowing configuration to be reused across unrelated projects. Plain values live
-in Midgard's central environment catalog; secrets live only in the OS keyring.
+Or begin a task immediately:
+
+```sh
+midgard "explain this repository and identify the next useful change"
+```
+
+Use `-repo PATH` to target another repository, `-profile NAME` to select a
+stored provider profile, and `-headless` for the original one-turn text
+interface. `midgard help` lists the full command surface.
+
+Provider keys are stored in the operating system keyring. An existing
+environment variable can be migrated only through the explicit
+`auth login --from-env NAME` command; Midgard has no secret-reveal command.
+The local Codex bridge reuses Codex's own login material and never imports it
+into Midgard.
+
+## What the terminal chat gives you
+
+The attached terminal interface is a workspace for an active coding turn, not a
+decorative token stream:
+
+- Live activity distinguishes preparation, model work, tool execution, checks,
+  success, and failures without showing hidden reasoning text.
+- File edits collapse into readable per-file change summaries and bounded,
+  colored diffs; routine command output stays compact.
+- `/` opens a filtered command menu. Use `/skills`, `/env`, `/repo add`,
+  `/model`, and `/auth` to open focused interfaces instead of memorizing flags.
+- Type guidance while the agent works and Midgard applies it at the next safe
+  boundary. `/stop` requests a controlled stop; `Ctrl+C` clears only the
+  composer.
+- Reopen a session to continue in its worktree. If a command's outcome is
+  unknown after interruption, Midgard says so and asks the next turn to inspect
+  the repository rather than pretending it knows the result.
+
+See the [terminal-chat guide](docs/tui.md) for the interaction contract and
+recovery behavior.
+
+## Reusable environments and project context
+
+Midgard replaces duplicated project `.env` files with named runtime
+environments. Plain settings live in Midgard's environment catalog; secret
+values remain only in the OS keyring. Environments can inherit from one parent
+and can be shared by unrelated projects.
 
 ```sh
 midgard env create shared-services
@@ -77,175 +144,81 @@ midgard env set shared-services LOG_LEVEL debug \
   --description "logging verbosity"
 midgard env set-secret shared-services SENTRY_DSN \
   --description "production error reporting"
-
-midgard env create production --parent shared-services
-midgard env set production PUBLIC_URL https://example.com
-midgard env use production
-midgard env status
+midgard env use shared-services
 ```
 
-`set-secret` uses a no-echo prompt; `--from-env NAME` explicitly migrates an
-existing process environment value. Midgard has no secret reveal command.
-`env status` reports variable names, kinds, descriptions, keyring-reference
-presence, and the environment revision that supplied each effective variable.
-It never retrieves or displays values. Values are retrieved only for a
-dispatched shell/check process.
+The model sees names, kinds, descriptions, and revision provenance—not values.
+Midgard injects values only into a shell or check child process after its action
+is durably committed and dispatched. That prevents accidental exposure through
+normal runtime state, but it does not make an agent-controlled process safe to
+trust with a production credential. Read the
+[environment decision](docs/decisions/0005-runtime-environments.md) before using
+real secrets.
 
-The selected environment is remembered by logical project. A turn commits its
-exact environment snapshot before dispatch, and only shell/check child processes
-receive the values. Known secret values are redacted from recorded output. An
-agent-controlled process can still deliberately write or transmit injected
-credentials, so it is appropriate only for trusted local repositories and is
-not a production containment boundary.
-
-With no task Midgard opens the current repository's session home; a task starts
-a terminal chat immediately:
-
-```sh
-go build -o midgard ./cmd/midgard
-./midgard -repo /path/to/repository \
-  "implement the requested change"
-```
-
-### Configuration hierarchy
-
-Non-secret settings merge in this order, with later layers winning:
-
-1. built-in defaults;
-2. the user file reported by `midgard config show` (on macOS, under
-   `~/Library/Application Support/midgard/config.json`);
-3. the selected user profile under the adjacent `profiles` directory;
-4. `<repo>/.midgard/config.json`;
-5. `<repo>/.midgard/profiles/<profile>.json`;
-6. repository-local Git settings written by conversational onboarding;
-7. explicit CLI flags.
-
-Both config files use the same optional JSON fields:
-
-```json
-{
-  "provider": "deepseek",
-  "profile": "work",
-  "model": "deepseek-v4-pro",
-  "base_url": "https://api.deepseek.com",
-  "default_branch": "main",
-  "landing_strategy": "direct",
-  "cleanup_when_landed": true,
-  "thinking": true,
-  "max_tokens": 16384,
-  "max_provider_calls": 24
-}
-```
-
-Run `midgard config show -repo /path/to/repository` to inspect the effective
-values, loaded layers, and the winning source for every field. Use `-profile
-NAME` to inspect a different profile. Unknown fields are rejected, including
-attempts to put an `api_key` in config.
-
-### Projects
-
-Starting Midgard in a Git repository needs no project setup. It receives a
-stable implicit project identity and keeps repository-local state. A named
-project is a centrally stored set of repository mounts; it does not require a
-shared parent directory or a new project root. On macOS these files live under
-`~/Library/Application Support/midgard/projects/`.
-
-Create a project from unrelated repositories:
-
-```sh
-midgard project create midgard-development \
-  -repo midgard=/path/to/midgard \
-  -repo bragi=/another/path/to/bragi
-```
-
-Or preserve the current implicit project identity while adding a repository:
-
-```sh
-midgard project upgrade midgard-development \
-  -repo /path/to/midgard \
-  -add-name bragi -add-path /another/path/to/bragi
-```
-
-Inside an active terminal chat, the conversational form performs the same
-upgrade and attaches a real worktree at the next idle turn boundary:
+A project is a logical, named set of repositories rather than a shared parent
+directory. Start in one repository without setup; add another later when the
+work requires it:
 
 ```text
-/repo add /another/path/to/bragi
+/repo add /path/to/another/repository
 ```
 
-Midgard asks for a project name when this is the second repository. Once added,
-agent tools name the repository they target, so a later turn can work across the
-attached worktrees.
+Midgard retains stable project and worktree identities as the project grows.
+Read [logical projects](docs/decisions/0004-rootless-logical-projects.md) for
+the exact model.
 
-A repository may belong to more than one project. Midgard remembers the chosen
-default in that repository's local Git config; `midgard project use` changes it.
+## What Midgard does—and does not—control
 
-Enter queues guidance at a safe boundary while the agent works. `Ctrl+C` clears
-the composer, `/stop` requests a controlled stop, and typing `/` opens the
-filtered command menu for interfaces such as `/skills` and `/env`. See
-[`docs/tui.md`](docs/tui.md).
+Midgard is the action authority around a model, not a replacement for every
+component of an agent stack.
 
-The original text-only execution remains available for automation:
+- It uses [Bragi](https://github.com/coadan/bragi) as the model-to-harness
+  protocol. Provider-native streams remain trace evidence; they do not directly
+  authorize tools.
+- It owns session ordering, action validation through result, worktree fences,
+  and evidence-based completion.
+- It can bundle local repository search through Yggdrasil and browser QA through
+  Heimdal, directing both at the session worktree.
+- It does **not** yet provide production process containment, remote control,
+  detached workers, a landing or pull-request workflow, a generic policy engine,
+  or an autonomous task planner.
+
+The current local executor is an explicit, temporary exception to the normal
+sandbox requirement. Use Midgard only on a repository and machine you trust;
+the [unsafe-local decision](docs/decisions/0002-unsafe-local-prototype.md)
+defines the limitation and its removal gate.
+
+## Verify a checkout
+
+Run the full local verification suite from the repository root:
 
 ```sh
-./midgard -headless -repo /path/to/repository \
-  "implement the requested change"
+go test ./...
+go test -race ./...
+go vet ./...
+go run ./cmd/midgard protocol-score \
+  -manifest testdata/protocol/manifest.json
 ```
 
-For a local installation with the bundled repository search and browser QA
-companions, run:
+The protocol scorer verifies the pinned Bragi profile against committed action,
+repair, rejection, and no-effect-before-acceptance fixtures.
 
-```sh
-sh ./scripts/install-local-bundle.sh
-```
+## Learn more
 
-Each turn defaults to at most 24 provider calls. `repo_search` uses the bundled
-Yggdrasil companion and returns bounded citations plus relevant follow-up
-paths, so the agent can locate relevant code before reading it. By default it
-is local lexical retrieval. The index stays under Midgard's project state and
-does not use Yggdrasil's user-wide configuration. An installer can enable
-Midgard-owned OpenAI-compatible embeddings without exposing their API key:
-
-```sh
-midgard auth login openai --profile personal
-midgard search embeddings enable \
-  --endpoint https://api.openai.com/v1/embeddings \
-  --model text-embedding-3-small --dimensions 1536 \
-  --provider openai --profile personal
-```
-
-Midgard writes only the endpoint/model and keyring reference to its own
-configuration, then passes the secret directly to bundled Yggdrasil for a
-search. `browser_run` similarly invokes only the bundled Heimdal browser QA
-executable inside the session worktree. `file_inspect` returns the current
-SHA-256 and `file_replace` atomically replaces an existing file only
-when that hash still matches; raw unified diffs remain available through
-`patch_apply`. Foreground `shell` calls default to a 60-second timeout and kill
-their complete process group when cancelled or timed out. Long-lived work uses
-`background=true`, which returns a session-owned handle for bounded incremental
-polling and explicit stopping. Each successful DeepSeek exchange stores the exact credential-free
-request and native response together in an immutable trace artifact.
-
-This composition is deliberately unsafe: shell commands run directly on the
-host without containment or per-action approval. Use it only with repositories
-and credentials you trust. The limitation is recorded in
-[`docs/decisions/0002-unsafe-local-prototype.md`](docs/decisions/0002-unsafe-local-prototype.md).
-Durable commit-before-dispatch, worker fencing, worktree isolation, provider
-traces, checks, and completion evidence remain active.
-
-## Kernel route
-
-The shortest route through the system is:
-
-```text
-provider observation -> raw trace artifact -> normalized protocol frame
- -> action intent -> validation/approval -> durable commit
- -> fenced workspace dispatch -> server-authored result -> evidence projection
-```
-
-Each projection reducer lives with the domain state it owns. Git is canonical
-for source state; artifacts are canonical for large payloads; SQLite is
-canonical for ordered events and compact projections.
+- [Documentation index](docs/README.md) — guides, architecture, current status,
+  and historical notes
+- [Terminal chat](docs/tui.md) — commands, rendering, recovery, and interaction
+  behavior
+- [Agent skills](docs/skills.md) — discovery, bounded retrieval, groups, and
+  project masks
+- [Implementation status](docs/implementation-status.md) — completed stages,
+  known limits, and gates
+- [Action state transitions](docs/action-transitions.md) — durable action
+  lifecycle and fences
+- [Architecture decision records](docs/README.md#architecture-and-guarantees) —
+  kernel boundary, environments, protocol, context budget, and Codex bridge
+- [Contributing](CONTRIBUTING.md) — development and verification expectations
+- [Security policy](SECURITY.md) — responsible disclosure and prototype scope
 
 ## License
 
